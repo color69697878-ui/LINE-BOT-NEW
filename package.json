@@ -1,7 +1,7 @@
 {
   "name": "line-multilang-translator-bot",
   "version": "6.5.0",
-  "description": "LINE 多語翻譯機器人（UI批准版）",
+  "description": "LINE 多語翻譯機器人（UI 一鍵批准版）",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
