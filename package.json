@@ -1,19 +1,29 @@
 {
-  "name": "line-translator-bot",
-  "version": "6.5.0",
-  "description": "LINE Translator Bot (Node.js + Render + OpenAI + Persistent Disk)",
+  "name": "line-translate-bot",
+  "version": "4.8.0",
+  "description": "LINE 中泰雙向翻譯機器人（支援混合字串 / mention / emoji / 規格碼保護）",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
     "start": "node index.js",
     "dev": "node index.js"
   },
+  "keywords": [
+    "line-bot",
+    "translation",
+    "thai",
+    "chinese",
+    "openai"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@line/bot-sdk": "^9.4.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "openai": "^4.57.0"
+  },
   "engines": {
     "node": ">=18"
-  },
-  "dependencies": {
-    "@line/bot-sdk": "^9.5.0",
-    "express": "^4.19.2",
-    "openai": "^4.52.0"
   }
 }
