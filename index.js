@@ -34,13 +34,9 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
 // =====================================================
 // 授權 / 管理設定
 // =====================================================
-// 必須授權後才可翻譯
 const REQUIRE_AUTHORIZATION = true;
-
-// 是否允許 1對1 私聊翻譯
 const AUTH_ALLOW_USER_CHAT = String(process.env.AUTH_ALLOW_USER_CHAT || 'false').toLowerCase() === 'true';
 
-// 管理員 userId，可多個，用逗號分隔
 const ADMIN_USER_IDS = new Set(
   String(process.env.ADMIN_USER_IDS || '')
     .split(',')
@@ -48,19 +44,15 @@ const ADMIN_USER_IDS = new Set(
     .filter(Boolean)
 );
 
-// 初始授權群組/聊天室，可多個
 const SEED_ALLOWED_SOURCE_IDS = String(process.env.ALLOWED_SOURCE_IDS || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
 
-// 預設模式
 const DEFAULT_TRANSLATION_MODE = String(process.env.TRANSLATION_MODE || 'zh-th').toLowerCase();
 
-// 指令前綴
 const COMMAND_PREFIXES = ['/', '!', '！', '／'];
 
-// 固定不翻字詞
 const ALWAYS_KEEP_WORDS = new Set([
   'UP',
   'DOWN',
@@ -89,7 +81,6 @@ const ALWAYS_KEEP_WORDS = new Set([
   '3XL',
 ]);
 
-// 自訂全域辭典
 const GLOBAL_DICTIONARY = [
   // {
   //   from: '藍白色',
@@ -101,7 +92,7 @@ const GLOBAL_DICTIONARY = [
 ];
 
 // =====================================================
-// 簡易資料儲存
+// 資料儲存
 // =====================================================
 const DATA_DIR = path.join(__dirname, 'data');
 const AUTH_FILE = path.join(DATA_DIR, 'authorized-sources.json');
@@ -138,7 +129,17 @@ function loadAuthStore() {
   const initial = readJsonSafe(AUTH_FILE, { sources: {} });
 
   if (!initial || typeof initial !== 'object' || !initial.sources || typeof initial.sources !== 'object') {
-    return { sources: {} };
+    const fresh = { sources: {} };
+    for (const sourceId of SEED_ALLOWED_SOURCE_IDS) {
+      fresh.sources[sourceId] = {
+        authorized: true,
+        mode: DEFAULT_TRANSLATION_MODE,
+        updatedAt: new Date().toISOString(),
+        note: 'seed from env',
+      };
+    }
+    writeJsonSafe(AUTH_FILE, fresh);
+    return fresh;
   }
 
   for (const sourceId of SEED_ALLOWED_SOURCE_IDS) {
@@ -214,11 +215,9 @@ function isCommand(text) {
 function isSystemControlText(text) {
   const t = normalizeText(text);
   if (!t) return false;
-
   if (/^UI_[A-Z0-9_:.-]+$/u.test(t)) return true;
   if (/^SYS_[A-Z0-9_:.-]+$/u.test(t)) return true;
   if (/^CMD_[A-Z0-9_:.-]+$/u.test(t)) return true;
-
   return false;
 }
 
@@ -325,9 +324,7 @@ function modeDisplayName(mode) {
 function containsEnoughHumanText(text) {
   if (!text) return false;
   if (hasChinese(text) || hasThai(text) || hasMyanmar(text)) return true;
-
-  const enWords = countEnglishWords(text);
-  return enWords >= 2;
+  return countEnglishWords(text) >= 2;
 }
 
 function shouldSkipBecausePureCode(text) {
@@ -351,6 +348,33 @@ function shouldTranslateText(text) {
   if (isSystemControlText(t)) return false;
   if (shouldSkipBecausePureCode(t)) return false;
   if (containsEnoughHumanText(t)) return true;
+  return false;
+}
+
+function isLikelyUntranslated(originalText, translatedText, targetLang) {
+  const original = normalizeText(originalText);
+  const translated = normalizeText(translatedText);
+
+  if (!original || !translated) return false;
+  if (original === translated) return true;
+
+  if (targetLang === '繁體中文') {
+    if ((hasThai(translated) || hasMyanmar(translated)) && !hasChinese(translated)) return true;
+    if (hasEnglish(original) && translated === original) return true;
+  }
+
+  if (targetLang === 'ไทย') {
+    if (hasChinese(translated) && !hasThai(translated)) return true;
+  }
+
+  if (targetLang === 'English') {
+    if (hasChinese(translated) && !hasEnglish(translated)) return true;
+  }
+
+  if (targetLang === 'မြန်မာဘာသာ') {
+    if (hasChinese(translated) && !hasMyanmar(translated)) return true;
+  }
+
   return false;
 }
 
@@ -381,17 +405,14 @@ function protectMentions(text, mention) {
     if (start < cursor) continue;
 
     result += text.slice(cursor, start);
-
     const original = text.slice(start, end);
     const ph = createPlaceholder('MENTION', idx++);
     map[ph] = original;
     result += ph;
-
     cursor = end;
   }
 
   result += text.slice(cursor);
-
   return { text: result, map };
 }
 
@@ -437,14 +458,12 @@ function protectAlwaysKeepWords(text) {
     });
   }
 
-  // 1430/40/2300
   out = out.replace(/\b\d+(?:\/\d+){1,}\b/g, (m) => {
     const ph = createPlaceholder('CODE', idx++);
     map[ph] = m;
     return ph;
   });
 
-  // 貨號 / 房號 / 規格 / 代碼
   out = out.replace(/\b(?:#?[A-Za-z]{1,6}\d{1,10}|\d{1,10}[A-Za-z]{1,6}|[A-Za-z]{1,6}-\d{1,10}|#?[A-Za-z0-9_-]{3,})\b/g, (m) => {
     if (hasChinese(m) || hasThai(m) || hasMyanmar(m)) return m;
 
@@ -542,123 +561,59 @@ function detectTranslationDirection(text, mode) {
   const myCount = countMyanmar(text);
   const enCount = countEnglishWords(text);
 
-  // zh-th:
-  // 中文 -> 泰文
-  // 泰文 -> 中文
-  // 英文 -> 中文
   if (m === 'zh-th') {
-    if (zh && !th) {
-      return { sourceLang: '繁體中文', targetLang: 'ไทย' };
-    }
-
-    if (th && !zh) {
-      return { sourceLang: 'ไทย', targetLang: '繁體中文' };
-    }
-
-    if (en && !zh && !th && !my) {
-      return { sourceLang: 'English', targetLang: '繁體中文' };
-    }
+    if (zh && !th) return { sourceLang: '繁體中文', targetLang: 'ไทย' };
+    if (th && !zh) return { sourceLang: 'ไทย', targetLang: '繁體中文' };
+    if (en && !zh && !th && !my) return { sourceLang: 'English', targetLang: '繁體中文' };
 
     if (zh && th) {
-      if (zhCount >= thCount) {
-        return { sourceLang: '繁體中文（含部分ไทย）', targetLang: 'ไทย' };
-      }
+      if (zhCount >= thCount) return { sourceLang: '繁體中文（含部分ไทย）', targetLang: 'ไทย' };
       return { sourceLang: 'ไทย（含部分中文）', targetLang: '繁體中文' };
     }
 
-    if (zh && en && !th) {
-      return { sourceLang: '繁體中文（含部分English）', targetLang: 'ไทย' };
-    }
-
-    if (th && en && !zh) {
-      return { sourceLang: 'ไทย（含部分English）', targetLang: '繁體中文' };
-    }
+    if (zh && en && !th) return { sourceLang: '繁體中文（含部分English）', targetLang: 'ไทย' };
+    if (th && en && !zh) return { sourceLang: 'ไทย（含部分English）', targetLang: '繁體中文' };
 
     if (zh && th && en) {
-      if (zhCount >= thCount) {
-        return { sourceLang: '繁體中文（含部分ไทย/English）', targetLang: 'ไทย' };
-      }
+      if (zhCount >= thCount) return { sourceLang: '繁體中文（含部分ไทย/English）', targetLang: 'ไทย' };
       return { sourceLang: 'ไทย（含部分中文/English）', targetLang: '繁體中文' };
     }
 
     return null;
   }
 
-  // zh-en:
-  // 中文 -> 英文
-  // 英文 -> 中文
   if (m === 'zh-en') {
-    if (zh && !en) {
-      return { sourceLang: '繁體中文', targetLang: 'English' };
-    }
-
-    if (en && !zh && !th && !my) {
-      return { sourceLang: 'English', targetLang: '繁體中文' };
-    }
+    if (zh && !en) return { sourceLang: '繁體中文', targetLang: 'English' };
+    if (en && !zh && !th && !my) return { sourceLang: 'English', targetLang: '繁體中文' };
 
     if (zh && en && !th && !my) {
-      if (zhCount >= enCount) {
-        return { sourceLang: '繁體中文（含部分English）', targetLang: 'English' };
-      }
+      if (zhCount >= enCount) return { sourceLang: '繁體中文（含部分English）', targetLang: 'English' };
       return { sourceLang: 'English（含部分中文）', targetLang: '繁體中文' };
     }
 
-    // 若在中英模式下混入泰文/緬文，優先仍回中文
-    if (th && !zh && !en) {
-      return { sourceLang: 'ไทย', targetLang: '繁體中文' };
-    }
-
-    if (my && !zh && !en) {
-      return { sourceLang: 'မြန်မာဘာသာ', targetLang: '繁體中文' };
-    }
-
-    if (th && en && !zh) {
-      return { sourceLang: 'ไทย（含部分English）', targetLang: '繁體中文' };
-    }
-
-    if (my && en && !zh) {
-      return { sourceLang: 'မြန်မာဘာသာ（含部分English）', targetLang: '繁體中文' };
-    }
+    if (th && !zh && !en) return { sourceLang: 'ไทย', targetLang: '繁體中文' };
+    if (my && !zh && !en) return { sourceLang: 'မြန်မာဘာသာ', targetLang: '繁體中文' };
+    if (th && en && !zh) return { sourceLang: 'ไทย（含部分English）', targetLang: '繁體中文' };
+    if (my && en && !zh) return { sourceLang: 'မြန်မာဘာသာ（含部分English）', targetLang: '繁體中文' };
 
     return null;
   }
 
-  // zh-my:
-  // 中文 -> 緬文
-  // 緬文 -> 中文
-  // 英文 -> 中文
   if (m === 'zh-my') {
-    if (zh && !my) {
-      return { sourceLang: '繁體中文', targetLang: 'မြန်မာဘာသာ' };
-    }
-
-    if (my && !zh) {
-      return { sourceLang: 'မြန်မာဘာသာ', targetLang: '繁體中文' };
-    }
-
-    if (en && !zh && !my && !th) {
-      return { sourceLang: 'English', targetLang: '繁體中文' };
-    }
+    if (zh && !my) return { sourceLang: '繁體中文', targetLang: 'မြန်မာဘာသာ' };
+    if (my && !zh) return { sourceLang: 'မြန်မာဘာသာ', targetLang: '繁體中文' };
+    if (en && !zh && !my && !th) return { sourceLang: 'English', targetLang: '繁體中文' };
 
     if (zh && my) {
-      if (zhCount >= myCount) {
-        return { sourceLang: '繁體中文（含部分မြန်မာဘာသာ）', targetLang: 'မြန်မာဘာသာ' };
-      }
+      if (zhCount >= myCount) return { sourceLang: '繁體中文（含部分မြန်မာဘာသာ）', targetLang: 'မြန်မာဘာသာ' };
       return { sourceLang: 'မြန်မာဘာသာ（含部分中文）', targetLang: '繁體中文' };
     }
 
-    if (zh && en && !my) {
-      return { sourceLang: '繁體中文（含部分English）', targetLang: 'မြန်မာဘာသာ' };
-    }
-
-    if (my && en && !zh) {
-      return { sourceLang: 'မြန်မာဘာသာ（含部分English）', targetLang: '繁體中文' };
-    }
+    if (zh && en && !my) return { sourceLang: '繁體中文（含部分English）', targetLang: 'မြန်မာဘာသာ' };
+    if (my && en && !zh) return { sourceLang: 'မြန်မာဘာသာ（含部分English）', targetLang: '繁體中文' };
 
     if (zh && my && en) {
-      if (zhCount >= myCount) {
-        return { sourceLang: '繁體中文（含部分မြန်မာဘာသာ/English）', targetLang: 'မြန်မာဘာသာ' };
-      }
+      if (zhCount >= myCount) return { sourceLang: '繁體中文（含部分မြန်မာဘာသာ/English）', targetLang: 'မြန်မာဘာသာ' };
       return { sourceLang: 'မြန်မာဘာသာ（含部分中文/English）', targetLang: '繁體中文' };
     }
 
@@ -673,22 +628,37 @@ function detectTranslationDirection(text, mode) {
 // =====================================================
 function buildTranslationPrompt(sourceLang, targetLang) {
   return `
-You are a high-accuracy chat translation engine.
+You are a STRICT translation engine.
 
 Task:
-Translate the user's message from ${sourceLang} into ${targetLang}.
+Translate ALL human-readable parts from ${sourceLang} into ${targetLang}.
 
-Critical rules:
-1. Preserve placeholders exactly, including [[[MENTION_0]]], [[[EMOJI_0]]], [[[URL_0]]], [[[KEEP_0]]], [[[CODE_0]]], [[[TOKEN_0]]].
-2. Never translate, remove, or alter placeholders.
-3. Translate only the natural-language parts.
-4. Mixed strings such as "1430/40/2300藍白色 [[[KEEP_0]]] mixed" must still be translated for the human-language parts.
-5. Keep codes, IDs, room numbers, slash-separated numbers, URLs, specs, and protected tokens unchanged.
-6. Keep line breaks as much as possible.
-7. Do not add explanations, labels, notes, quotation marks, or extra text.
-8. Return only the translated text.
-9. Keep the tone natural for chat messages.
-10. If the input contains English and the target is Chinese, translate the English into natural Traditional Chinese.
+MANDATORY RULES:
+1. You MUST translate the text. Never keep the original language unchanged when translation is needed.
+2. Even if the text already partially looks like the target language, you STILL must translate it properly.
+3. Mixed-language sentences MUST be translated into a consistent target language.
+4. Do NOT decide "no translation needed".
+5. Preserve placeholders exactly:
+   [[[MENTION_*]]], [[[EMOJI_*]]], [[[URL_*]]], [[[KEEP_*]]], [[[CODE_*]]], [[[TOKEN_*]]]
+6. Never translate, remove, or alter placeholders.
+7. Keep numbers, codes, IDs, slash-separated patterns, URLs, room numbers, stock/spec strings, and protected tokens unchanged.
+8. Translate only the natural-language parts.
+9. Keep line breaks as much as possible.
+10. Output ONLY the translated result. No explanation, no labels, no quotation marks.
+
+IMPORTANT:
+- Thai -> Traditional Chinese must become natural Traditional Chinese.
+- Chinese -> Thai must become natural Thai.
+- English -> Traditional Chinese when target is Chinese.
+- Chinese -> English must become natural English.
+- Myanmar -> Traditional Chinese must become natural Traditional Chinese.
+- Chinese -> Myanmar must become natural Myanmar.
+- DO NOT return the original text unchanged unless every human-readable part is already exactly in the required target language.
+
+Examples:
+- "1430/40/2300藍白色 [[[KEEP_0]]] mixed" -> keep 1430/40/2300 and [[[KEEP_0]]] unchanged, translate 藍白色 and mixed.
+- Long Thai sentence in zh-th mode -> output must be Chinese, not Thai.
+- Long English sentence in zh-th or zh-my mode -> output must be Chinese.
 `.trim();
 }
 
@@ -697,7 +667,7 @@ async function translateWithOpenAI(protectedText, sourceLang, targetLang) {
 
   const response = await openai.chat.completions.create({
     model: OPENAI_MODEL,
-    temperature: 0.1,
+    temperature: 0.0,
     messages: [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: protectedText },
@@ -717,7 +687,7 @@ async function translateText(text, mention, mode) {
   const beforeDict = applyGlobalDictionaryBefore(normalized);
   const protectedPack = protectText(beforeDict, mention);
 
-  const translatedProtected = await translateWithOpenAI(
+  let translatedProtected = await translateWithOpenAI(
     protectedPack.text,
     direction.sourceLang,
     direction.targetLang
@@ -731,7 +701,31 @@ async function translateText(text, mention, mode) {
 
   if (!restored) return null;
 
-  return restored;
+  // 若看起來像沒翻，再重試一次
+  if (isLikelyUntranslated(normalized, restored, direction.targetLang)) {
+    const retryInput =
+      `Translate this strictly into ${direction.targetLang}. ` +
+      `Do not keep the original source language. ` +
+      `Preserve placeholders exactly.\n\n${protectedPack.text}`;
+
+    translatedProtected = await translateWithOpenAI(
+      retryInput,
+      direction.sourceLang,
+      direction.targetLang
+    );
+
+    if (translatedProtected) {
+      let retryRestored = restorePlaceholders(translatedProtected, protectedPack.map);
+      retryRestored = applyGlobalDictionaryAfter(retryRestored, direction.targetLang);
+      retryRestored = retryRestored.trim();
+
+      if (retryRestored) {
+        restored = retryRestored;
+      }
+    }
+  }
+
+  return restored || null;
 }
 
 // =====================================================
@@ -787,6 +781,7 @@ async function handleCommand(event, text) {
 - zh-th：中文→泰文，泰文→中文，英文→中文
 - zh-en：中文→英文，英文→中文
 - zh-my：中文→緬文，緬文→中文，英文→中文
+- 長句已加強強制翻譯與重試
 - mention / emoji / URL 保留
 - sticker / 圖片 / 影片 / 音訊 / 檔案不翻
 - UI_SET_LANG:my:zh 這類系統字串一律跳過`
@@ -797,10 +792,11 @@ async function handleCommand(event, text) {
     const authorized = isSourceAuthorized(event);
     const mode = sourceId ? getSourceMode(sourceId) : DEFAULT_TRANSLATION_MODE;
     const admin = isAdmin(event);
+    const userId = getUserIdFromEvent(event) || 'unknown';
 
     return replyText(
       event.replyToken,
-      `授權狀態：${authorized ? '已授權' : '未授權'}\n模式：${mode}（${modeDisplayName(mode)}）\n管理員：${admin ? '是' : '否'}`
+      `授權狀態：${authorized ? '已授權' : '未授權'}\n模式：${mode}（${modeDisplayName(mode)}）\n管理員：${admin ? '是' : '否'}\n你的 userId：${userId}`
     );
   }
 
@@ -835,11 +831,7 @@ async function handleCommand(event, text) {
     return replyText(event.replyToken, '已取消此群組/聊天室的翻譯授權。');
   }
 
-  if (
-    lower === '/mode zh-th' ||
-    lower === '/mode zh-en' ||
-    lower === '/mode zh-my'
-  ) {
+  if (lower === '/mode zh-th' || lower === '/mode zh-en' || lower === '/mode zh-my') {
     if (!isAdmin(event)) {
       return replyText(event.replyToken, '你沒有切換模式的權限。');
     }
@@ -877,12 +869,10 @@ async function handleTextMessage(event) {
     return handleCommand(event, originalText);
   }
 
-  // 系統控制字串一律跳過
   if (isSystemControlText(originalText)) {
     return null;
   }
 
-  // 嚴格要求：未授權群組/聊天室不能翻
   if (REQUIRE_AUTHORIZATION && !isSourceAuthorized(event)) {
     const sourceType = getSourceType(event);
 
@@ -906,7 +896,6 @@ async function handleTextMessage(event) {
   const translated = await translateText(originalText, msg.mention, mode);
 
   if (!translated) return null;
-  if (translated === normalizeText(originalText)) return null;
 
   return replyText(event.replyToken, translated);
 }
@@ -917,10 +906,7 @@ async function handleTextMessage(event) {
 async function handleEvent(event) {
   try {
     if (event.type !== 'message') return null;
-
-    // sticker / image / video / audio / file 不翻
     if (event.message.type !== 'text') return null;
-
     return await handleTextMessage(event);
   } catch (err) {
     console.error('handleEvent error:', err);
