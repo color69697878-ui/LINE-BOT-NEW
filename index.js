@@ -1,38 +1,12 @@
-"use strict";
+'use strict';
 
-/**
- * LINE 翻譯機器人 PRO 完整版
- * 功能：
- * - 群組授權
- * - 控制面板
- * - 中文 <-> 泰文
- * - 緬甸文 -> 中文
- * - 英文 -> 中文
- * - mention 保留並翻譯後方內容
- * - sticker / emoji 不翻
- * - 指令不誤判
- * - 支援代碼 + 顏色/短中文 + 英文尾巴，例如：
- *   1430/40/2300藍白色 UP
- * - Persistent Disk
- * - debug 可開關
- */
+require('dotenv').config();
 
-const fs = require("fs");
-const path = require("path");
-const express = require("express");
-const line = require("@line/bot-sdk");
-const OpenAI = require("openai");
+const express = require('express');
+const line = require('@line/bot-sdk');
+const OpenAI = require('openai');
 
-// =========================
-// 基本設定
-// =========================
-const PORT = process.env.PORT || 3000;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
-const ADMIN_USER_ID = process.env.ADMIN_USER_ID || "";
-const DEBUG_WEBHOOK = process.env.DEBUG_WEBHOOK === "true";
-const DEBUG_GROUP_ID = process.env.DEBUG_GROUP_ID || "";
-const DATA_DIR = process.env.DATA_DIR || "/var/data";
-const DB_FILE = path.join(DATA_DIR, "db.json");
+const app = express();
 
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
@@ -40,1214 +14,547 @@ const config = {
 };
 
 if (!config.channelAccessToken || !config.channelSecret || !process.env.OPENAI_API_KEY) {
-  console.error("缺少必要環境變數：LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET / OPENAI_API_KEY");
+  console.error('❌ 缺少必要環境變數：LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET / OPENAI_API_KEY');
   process.exit(1);
 }
 
 const client = new line.Client(config);
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const app = express();
-
-// =========================
-// 資料檔
-// =========================
-ensureDir(DATA_DIR);
-console.log("📦 DATA_DIR =", DATA_DIR);
-console.log("📦 DB_FILE =", DB_FILE);
-
-const db = loadJson(DB_FILE, {
-  allowGroups: {},
-  pendingGroups: {},
-  groups: {},
-  globalKeepWords: [],
-  globalDict: {},
-  contexts: {},
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
 });
 
-const DEFAULT_KEEP_WORDS = [
-  "IN", "OUT", "OK", "VIP", "NO", "NO.", "KG", "G", "CM", "MM",
-  "M", "L", "XL", "XXL", "PCS", "PC", "SET", "COD", "SKU", "ID", "UP"
+const PORT = Number(process.env.PORT || 3000);
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
+
+// 這版改成雙向自動翻譯
+const LANG_ZH = '繁體中文';
+const LANG_TH = 'ไทย';
+
+// 是否啟用群組授權（true / false）
+const ENABLE_GROUP_AUTH = String(process.env.ENABLE_GROUP_AUTH || 'false').toLowerCase() === 'true';
+
+// 允許的群組 / 房間 ID（逗號分隔）
+const ALLOWED_SOURCE_IDS = new Set(
+  String(process.env.ALLOWED_SOURCE_IDS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+);
+
+// 指令前綴
+const COMMAND_PREFIXES = ['/', '!', '！', '／'];
+
+// 固定不翻字詞
+const ALWAYS_KEEP_WORDS = new Set([
+  'UP',
+  'DOWN',
+  'IN',
+  'OUT',
+  'ON',
+  'OFF',
+  'VIP',
+  'KTV',
+  'LINE',
+  'TG',
+  'DM',
+  'PM',
+  'AM',
+  'OK',
+  'PC',
+  'IOS',
+  'ANDROID',
+  'XS',
+  'S',
+  'M',
+  'L',
+  'XL',
+  'XXL',
+  '2XL',
+  '3XL',
+]);
+
+// 全域辭典：可自行擴充
+const GLOBAL_DICTIONARY = [
+  // { from: '藍白色', toZh: '藍白色', toTh: 'สีฟ้าขาว' },
+  // { from: '混色', toZh: '混色', toTh: 'ผสมสี' },
 ];
 
 // =========================
-// HTTP 路由
+// 工具
 // =========================
-app.get("/", (req, res) => {
-  res.status(200).send("LINE Translator Bot PRO running");
-});
-
-app.get("/healthz", (req, res) => {
-  res.status(200).json({
-    ok: true,
-    dataDir: DATA_DIR,
-    dbFile: DB_FILE,
-    time: new Date().toISOString(),
-    debugWebhook: DEBUG_WEBHOOK
-  });
-});
-
-app.post("/webhook", line.middleware(config), async (req, res) => {
-  try {
-    const events = Array.isArray(req.body?.events) ? req.body.events : [];
-    console.log(`📨 webhook hit: ${events.length}`);
-
-    if (DEBUG_WEBHOOK) {
-      for (const [i, event] of events.entries()) {
-        if (!shouldDebugEvent(event)) continue;
-        console.log("🔍 event detail:", JSON.stringify({
-          index: i,
-          type: event?.type,
-          sourceType: event?.source?.type,
-          groupId: event?.source?.groupId || "",
-          roomId: event?.source?.roomId || "",
-          userId: event?.source?.userId || "",
-          messageType: event?.message?.type || "",
-          text: event?.message?.text || ""
-        }));
-      }
-    }
-
-    await Promise.all(events.map(handleEvent));
-    res.status(200).end();
-  } catch (err) {
-    console.error("Webhook error:", err);
-    res.status(500).end();
-  }
-});
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running on port ${PORT}`);
-});
-
-// =========================
-// 主事件處理
-// =========================
-async function handleEvent(event) {
-  try {
-    if (DEBUG_WEBHOOK && shouldDebugEvent(event)) {
-      console.log("🧩 handleEvent:", JSON.stringify({
-        type: event?.type,
-        sourceType: event?.source?.type,
-        groupId: event?.source?.groupId || "",
-        userId: event?.source?.userId || "",
-        messageType: event?.message?.type || "",
-        text: event?.message?.text || ""
-      }));
-    }
-
-    const source = event.source || {};
-    const sourceType = source.type || "";
-    const groupId = source.groupId || "";
-    const userId = source.userId || "";
-
-    if (event.type === "join") {
-      if (sourceType === "group" && groupId) {
-        markPendingGroup(groupId);
-        return safePushFlex(groupId, buildApproveFlex("此群尚未授權，請管理員按下方按鈕啟用。"));
-      }
-      return null;
-    }
-
-    if (event.type !== "message") return null;
-    if (!event.message) return null;
-    if (sourceType !== "group" || !groupId) return null;
-
-    if (event.message.type === "sticker") return null;
-    if (event.message.type !== "text") return null;
-
-    const rawText = event.message.text || "";
-    const trimmedRaw = rawText.trim();
-    if (!trimmedRaw) return null;
-
-    if (!db.allowGroups[groupId]) {
-      markPendingGroup(groupId);
-    }
-
-    // 指令：只有原始訊息開頭就是 / 才算
-    const commandHandled = await handleCommand(event, trimmedRaw, groupId, userId);
-    if (commandHandled) return commandHandled;
-
-    if (!db.allowGroups[groupId]) {
-      if (isAdmin(userId) && shouldPromptPendingGroup(groupId)) {
-        touchPendingPromptTime(groupId);
-        return safeReplyFlex(event.replyToken, buildApproveFlex("此群尚未授權，按下方按鈕即可啟用。"));
-      }
-      return null;
-    }
-
-    initGroupSettings(groupId);
-    const settings = db.groups[groupId];
-    if (!settings.enable) return null;
-
-    const mentionInfo = extractMentionInfo(rawText);
-    const translatableText = mentionInfo.cleanText.trim();
-
-    // 只有 mention / emoji / 空白，沒有真正內容
-    if (!translatableText) return null;
-
-    // 清理後如果像指令，也不翻
-    if (translatableText.startsWith("/")) return null;
-
-    const lang = detectMainLanguage(translatableText);
-    if (lang === "mixed" || lang === "other") return null;
-
-    const chatKey = getChatKey(source);
-    const contextList = getRecentContext(chatKey, 3);
-
-    let result = null;
-    let resultLang = null;
-
-    if (lang === "en" && settings.englishAutoZh) {
-      result = await translateMessage({
-        text: translatableText,
-        sourceLang: "en",
-        targetLang: "zh",
-        groupId,
-        contextList,
-      });
-      resultLang = "zh";
-    } else if (lang === settings.langA) {
-      result = await translateMessage({
-        text: translatableText,
-        sourceLang: settings.langA,
-        targetLang: settings.langB,
-        groupId,
-        contextList,
-      });
-      resultLang = settings.langB;
-    } else if (lang === settings.langB) {
-      result = await translateMessage({
-        text: translatableText,
-        sourceLang: settings.langB,
-        targetLang: settings.langA,
-        groupId,
-        contextList,
-      });
-      resultLang = settings.langA;
-    }
-
-    if (!result || !result.trim() || result.trim() === translatableText.trim()) {
-      return null;
-    }
-
-    const finalText = rebuildMentionText(mentionInfo, result);
-
-    pushContext(chatKey, { role: "user", text: translatableText, lang });
-    pushContext(chatKey, { role: "assistant", text: result, lang: resultLang });
-
-    return safeReply(event.replyToken, finalText);
-  } catch (err) {
-    console.error("handleEvent error:", err);
-    return null;
-  }
+function escapeRegExp(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-// =========================
-// 指令 / UI
-// =========================
-async function handleCommand(event, text, groupId, userId) {
-  const lower = text.toLowerCase();
+function normalizeText(text) {
+  return (text || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\u00A0/g, ' ')
+    .trim();
+}
 
-  if (text === "UI_APPROVE_GROUP") {
-    if (!isAdmin(userId)) {
-      return safeReply(event.replyToken, "你沒有權限操作此按鈕。");
+function hasChinese(text) {
+  return /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/.test(text);
+}
+
+function hasThai(text) {
+  return /[\u0E00-\u0E7F]/.test(text);
+}
+
+function hasLatin(text) {
+  return /[A-Za-z]/.test(text);
+}
+
+function isOnlyWhitespace(text) {
+  return !text || !text.trim();
+}
+
+function isCommand(text) {
+  const t = normalizeText(text);
+  if (!t) return false;
+  if (!COMMAND_PREFIXES.some(p => t.startsWith(p))) return false;
+  return /^([/!！／])[A-Za-z\u0E00-\u0E7F\u4e00-\u9fff][^\n]*$/.test(t);
+}
+
+function isAllowedSource(event) {
+  if (!ENABLE_GROUP_AUTH) return true;
+  const source = event.source || {};
+  const sourceId = source.groupId || source.roomId || source.userId || '';
+  if (!sourceId) return false;
+  return ALLOWED_SOURCE_IDS.has(sourceId);
+}
+
+function containsEnoughHumanText(text) {
+  if (!text) return false;
+
+  // 只要有中文或泰文，就視為有人類語言內容
+  if (hasChinese(text) || hasThai(text)) return true;
+
+  // 一般英文字至少有 2 個單字再算
+  const words = text.match(/[A-Za-z]+/g) || [];
+  return words.length >= 2;
+}
+
+function shouldSkipBecausePureCode(text) {
+  // 只在完全沒有中泰文時才考慮略過
+  if (hasChinese(text) || hasThai(text)) return false;
+
+  const stripped = text.replace(/\s+/g, '');
+  if (!stripped) return true;
+
+  // 純規格、數字、代碼
+  if (/^[A-Za-z0-9\-_/.:#+()&\[\]%]+$/.test(stripped)) {
+    const words = text.match(/[A-Za-z]+/g) || [];
+    if (words.length <= 2) return true;
+  }
+
+  return false;
+}
+
+function shouldTranslateText(text) {
+  const t = normalizeText(text);
+  if (!t) return false;
+  if (isCommand(t)) return false;
+  if (shouldSkipBecausePureCode(t)) return false;
+  if (containsEnoughHumanText(t)) return true;
+  return false;
+}
+
+function detectTranslationDirection(text) {
+  const zh = hasChinese(text);
+  const th = hasThai(text);
+
+  // 純中文 -> 泰文
+  if (zh && !th) {
+    return {
+      sourceLang: LANG_ZH,
+      targetLang: LANG_TH,
+    };
+  }
+
+  // 純泰文 -> 中文
+  if (th && !zh) {
+    return {
+      sourceLang: LANG_TH,
+      targetLang: LANG_ZH,
+    };
+  }
+
+  // 中泰混合：以句中較主要語言決定方向
+  const zhCount = (text.match(/[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/g) || []).length;
+  const thCount = (text.match(/[\u0E00-\u0E7F]/g) || []).length;
+
+  if (zh && th) {
+    if (zh >= th) {
+      return {
+        sourceLang: `${LANG_ZH}（含部分ไทย）`,
+        targetLang: LANG_TH,
+      };
     }
-    approveGroup(groupId);
-    return safeReplyFlex(event.replyToken, buildPanelFlex(groupId, "群組已授權，並已開啟翻譯。"));
+    return {
+      sourceLang: `${LANG_TH}（含部分中文）`,
+      targetLang: LANG_ZH,
+    };
   }
 
-  if (lower === "ui_open_panel") {
-    if (!isAdmin(userId)) {
-      return safeReply(event.replyToken, "你沒有權限操作此面板。");
-    }
-    if (!db.allowGroups[groupId]) {
-      return safeReplyFlex(event.replyToken, buildApproveFlex("此群尚未授權，請先批准。"));
-    }
-    initGroupSettings(groupId);
-    return safeReplyFlex(event.replyToken, buildPanelFlex(groupId));
-  }
-
-  if (text.startsWith("UI_SET_LANG:")) {
-    if (!isAdmin(userId)) return safeReply(event.replyToken, "你沒有權限操作此面板。");
-    if (!db.allowGroups[groupId]) return safeReply(event.replyToken, "此群尚未授權。");
-
-    const parts = text.split(":");
-    const a = parts[1];
-    const b = parts[2];
-    if (!isSupportedLang(a) || !isSupportedLang(b)) {
-      return safeReply(event.replyToken, "語言代碼無效。");
-    }
-
-    initGroupSettings(groupId);
-    db.groups[groupId].langA = a;
-    db.groups[groupId].langB = b;
-    saveDb();
-
-    return safeReplyFlex(event.replyToken, buildPanelFlex(groupId, `已設定 ${langLabel(a)} ⇄ ${langLabel(b)}`));
-  }
-
-  if (lower === "ui_toggle_on") {
-    if (!isAdmin(userId)) return safeReply(event.replyToken, "你沒有權限操作此面板。");
-    if (!db.allowGroups[groupId]) return safeReply(event.replyToken, "此群尚未授權。");
-
-    initGroupSettings(groupId);
-    db.groups[groupId].enable = true;
-    saveDb();
-
-    return safeReplyFlex(event.replyToken, buildPanelFlex(groupId, "翻譯已開啟"));
-  }
-
-  if (lower === "ui_toggle_off") {
-    if (!isAdmin(userId)) return safeReply(event.replyToken, "你沒有權限操作此面板。");
-    if (!db.allowGroups[groupId]) return safeReply(event.replyToken, "此群尚未授權。");
-
-    initGroupSettings(groupId);
-    db.groups[groupId].enable = false;
-    saveDb();
-
-    return safeReplyFlex(event.replyToken, buildPanelFlex(groupId, "翻譯已關閉"));
-  }
-
-  if (lower === "ui_toggle_english_auto_zh") {
-    if (!isAdmin(userId)) return safeReply(event.replyToken, "你沒有權限操作此面板。");
-    if (!db.allowGroups[groupId]) return safeReply(event.replyToken, "此群尚未授權。");
-
-    initGroupSettings(groupId);
-    db.groups[groupId].englishAutoZh = !db.groups[groupId].englishAutoZh;
-    saveDb();
-
-    return safeReplyFlex(
-      event.replyToken,
-      buildPanelFlex(groupId, `英文自動翻中文：${db.groups[groupId].englishAutoZh ? "已開啟" : "已關閉"}`)
-    );
-  }
-
-  if (lower === "/whoami") {
-    return safeReply(event.replyToken, [
-      `groupId: ${groupId || ""}`,
-      `userId: ${userId || ""}`,
-      `isAdmin: ${isAdmin(userId)}`
-    ].join("\n"));
-  }
-
-  if (lower === "/status") {
-    initGroupSettings(groupId);
-    const allowed = !!db.allowGroups[groupId];
-    const g = db.groups[groupId] || {};
-    return safeReply(event.replyToken, [
-      `群組授權：${allowed ? "已授權" : "未授權"}`,
-      `翻譯：${g.enable ? "開啟" : "關閉"}`,
-      `語言：${langLabel(g.langA || "zh")} ⇄ ${langLabel(g.langB || "th")}`,
-      `英文自動翻中：${g.englishAutoZh ? "開啟" : "關閉"}`,
-      `DATA_DIR：${DATA_DIR}`
-    ].join("\n"));
-  }
-
-  if (!text.startsWith("/")) return null;
-
-  const args = text.split(/\s+/);
-  const cmd = args[0];
-
-  if (cmd === "/批准") {
-    if (!isAdmin(userId)) {
-      return safeReply(event.replyToken, "你沒有權限執行此指令。");
-    }
-    approveGroup(groupId);
-    return safeReplyFlex(event.replyToken, buildPanelFlex(groupId, "群組已授權，並已開啟翻譯。"));
-  }
-
-  if (cmd === "/面板") {
-    if (!isAdmin(userId)) {
-      return safeReply(event.replyToken, "你沒有權限開啟面板。");
-    }
-    if (!db.allowGroups[groupId]) {
-      return safeReplyFlex(event.replyToken, buildApproveFlex("此群尚未授權，請先批准。"));
-    }
-    initGroupSettings(groupId);
-    return safeReplyFlex(event.replyToken, buildPanelFlex(groupId));
-  }
-
-  if (cmd === "/setlang") {
-    if (!isAdmin(userId)) return safeReply(event.replyToken, "你沒有權限執行此指令。");
-    if (!db.allowGroups[groupId]) return safeReply(event.replyToken, "此群尚未授權。");
-
-    const a = args[1];
-    const b = args[2];
-    if (!isSupportedLang(a) || !isSupportedLang(b)) {
-      return safeReply(event.replyToken, "用法：/setlang zh th");
-    }
-
-    initGroupSettings(groupId);
-    db.groups[groupId].langA = a;
-    db.groups[groupId].langB = b;
-    saveDb();
-
-    return safeReply(event.replyToken, `已設定 ${langLabel(a)} ⇄ ${langLabel(b)}`);
-  }
-
-  if (cmd === "/lang") {
-    if (!db.allowGroups[groupId]) return safeReply(event.replyToken, "此群尚未授權。");
-    initGroupSettings(groupId);
-    const g = db.groups[groupId];
-    return safeReply(
-      event.replyToken,
-      `目前語言：${langLabel(g.langA)} ⇄ ${langLabel(g.langB)}\n翻譯：${g.enable ? "開啟" : "關閉"}\n英文自動翻中：${g.englishAutoZh ? "開啟" : "關閉"}`
-    );
-  }
-
-  if (cmd === "/on") {
-    if (!isAdmin(userId)) return safeReply(event.replyToken, "你沒有權限執行此指令。");
-    if (!db.allowGroups[groupId]) return safeReply(event.replyToken, "此群尚未授權。");
-
-    initGroupSettings(groupId);
-    db.groups[groupId].enable = true;
-    saveDb();
-    return safeReply(event.replyToken, "翻譯已開啟。");
-  }
-
-  if (cmd === "/off") {
-    if (!isAdmin(userId)) return safeReply(event.replyToken, "你沒有權限執行此指令。");
-    if (!db.allowGroups[groupId]) return safeReply(event.replyToken, "此群尚未授權。");
-
-    initGroupSettings(groupId);
-    db.groups[groupId].enable = false;
-    saveDb();
-    return safeReply(event.replyToken, "翻譯已關閉。");
-  }
-
-  if (cmd === "/help") {
-    return safeReply(
-      event.replyToken,
-      [
-        "可用指令：",
-        "/批准",
-        "/面板",
-        "/setlang zh th",
-        "/lang",
-        "/on",
-        "/off",
-        "/status",
-        "/whoami"
-      ].join("\n")
-    );
-  }
-
+  // 若沒有中泰文，但有一般英文，預設不處理
   return null;
 }
 
-// =========================
-// 群組授權 / 設定
-// =========================
-function approveGroup(groupId) {
-  db.allowGroups[groupId] = true;
-  delete db.pendingGroups[groupId];
-
-  db.groups[groupId] = {
-    enable: true,
-    langA: "zh",
-    langB: "th",
-    englishAutoZh: true,
-    keepWords: db.groups[groupId]?.keepWords || [],
-    dict: db.groups[groupId]?.dict || {},
-  };
-
-  saveDb();
-}
-
-function markPendingGroup(groupId) {
-  if (!db.pendingGroups[groupId]) {
-    db.pendingGroups[groupId] = {
-      firstSeenAt: Date.now(),
-      lastPromptAt: 0,
-    };
-    saveDb();
-  }
-}
-
-function touchPendingPromptTime(groupId) {
-  if (!db.pendingGroups[groupId]) {
-    db.pendingGroups[groupId] = {
-      firstSeenAt: Date.now(),
-      lastPromptAt: Date.now(),
-    };
-  } else {
-    db.pendingGroups[groupId].lastPromptAt = Date.now();
-  }
-  saveDb();
-}
-
-function shouldPromptPendingGroup(groupId) {
-  const item = db.pendingGroups[groupId];
-  if (!item) return true;
-  const last = item.lastPromptAt || 0;
-  return Date.now() - last > 60 * 1000;
-}
-
-function initGroupSettings(groupId) {
-  if (!db.groups[groupId]) {
-    db.groups[groupId] = {
-      enable: true,
-      langA: "zh",
-      langB: "th",
-      englishAutoZh: true,
-      keepWords: [],
-      dict: {}
-    };
-    saveDb();
-    return;
-  }
-
-  const g = db.groups[groupId];
-  if (typeof g.enable !== "boolean") g.enable = true;
-  if (!g.langA) g.langA = "zh";
-  if (!g.langB) g.langB = "th";
-  if (typeof g.englishAutoZh !== "boolean") g.englishAutoZh = true;
-  if (!Array.isArray(g.keepWords)) g.keepWords = [];
-  if (!g.dict || typeof g.dict !== "object") g.dict = {};
-  saveDb();
+function createPlaceholder(type, idx) {
+  return `[[[${type}_${idx}]]]`;
 }
 
 // =========================
-// Flex UI
+// Placeholder 保護
 // =========================
-function buildApproveFlex(message) {
-  return {
-    type: "bubble",
-    body: {
-      type: "box",
-      layout: "vertical",
-      spacing: "md",
-      contents: [
-        { type: "text", text: "群組授權", weight: "bold", size: "xl" },
-        { type: "text", text: message, wrap: true, size: "sm", color: "#666666" },
-        { type: "separator", margin: "md" },
-        {
-          type: "text",
-          text: "只有管理員按下「批准此群」才會生效。",
-          wrap: true,
-          size: "xs",
-          color: "#999999",
-          margin: "md"
-        }
-      ]
-    },
-    footer: {
-      type: "box",
-      layout: "vertical",
-      spacing: "sm",
-      contents: [
-        {
-          type: "button",
-          style: "primary",
-          action: {
-            type: "message",
-            label: "批准此群",
-            text: "UI_APPROVE_GROUP"
-          }
-        }
-      ]
-    }
-  };
-}
-
-function buildPanelFlex(groupId, tipText = "") {
-  initGroupSettings(groupId);
-  const g = db.groups[groupId];
-
-  const statusText = g.enable ? "🟢 已開啟" : "🔴 已關閉";
-  const englishAutoText = g.englishAutoZh ? "🟢 開啟" : "⚪ 關閉";
-  const langText = `${langLabel(g.langA)} ⇄ ${langLabel(g.langB)}`;
-
-  const contents = [
-    { type: "text", text: "翻譯控制面板", weight: "bold", size: "xl" },
-    { type: "text", text: `狀態：${statusText}`, margin: "md", size: "sm" },
-    { type: "text", text: `語言：${langText}`, margin: "sm", size: "sm" },
-    { type: "text", text: `英文自動翻中：${englishAutoText}`, margin: "sm", size: "sm" },
-  ];
-
-  if (tipText) {
-    contents.push({
-      type: "text",
-      text: tipText,
-      wrap: true,
-      size: "sm",
-      color: "#0B57D0",
-      margin: "md"
-    });
+function protectMentions(text, mention) {
+  if (!mention || !Array.isArray(mention.mentionees) || mention.mentionees.length === 0) {
+    return { text, map: {} };
   }
 
-  contents.push(
-    { type: "separator", margin: "lg" },
-    { type: "text", text: "語言設定", weight: "bold", margin: "lg", size: "sm" }
-  );
+  const sorted = [...mention.mentionees]
+    .filter(m => Number.isInteger(m.index) && Number.isInteger(m.length))
+    .sort((a, b) => a.index - b.index);
 
-  return {
-    type: "bubble",
-    body: {
-      type: "box",
-      layout: "vertical",
-      spacing: "sm",
-      contents
-    },
-    footer: {
-      type: "box",
-      layout: "vertical",
-      spacing: "sm",
-      contents: [
-        rowButtons([
-          btn("中文⇄泰文", "UI_SET_LANG:zh:th"),
-          btn("英文⇄中文", "UI_SET_LANG:en:zh")
-        ]),
-        rowButtons([
-          btn("緬甸⇄中文", "UI_SET_LANG:my:zh"),
-          btn(g.enable ? "關閉翻譯" : "開啟翻譯", g.enable ? "UI_TOGGLE_OFF" : "UI_TOGGLE_ON")
-        ]),
-        rowButtons([
-          btn("切換英文自動翻中", "UI_TOGGLE_ENGLISH_AUTO_ZH"),
-          btn("重新整理面板", "UI_OPEN_PANEL")
-        ])
-      ]
-    }
-  };
-}
+  let result = '';
+  let cursor = 0;
+  const map = {};
+  let idx = 0;
 
-function btn(label, text) {
-  return {
-    type: "button",
-    style: "primary",
-    height: "sm",
-    action: {
-      type: "message",
-      label,
-      text
-    }
-  };
-}
+  for (const m of sorted) {
+    const start = m.index;
+    const end = m.index + m.length;
+    if (start < cursor) continue;
 
-function rowButtons(buttons) {
-  return {
-    type: "box",
-    layout: "horizontal",
-    spacing: "sm",
-    contents: buttons
-  };
-}
-
-// =========================
-// 翻譯主流程
-// =========================
-async function translateMessage({ text, sourceLang, targetLang, groupId, contextList }) {
-  const protectedPack = protectAll(text, groupId);
-  let protectedText = protectedPack.text;
-
-  const lines = protectedText.split(/\r?\n/);
-  const outLines = [];
-
-  for (const lineText of lines) {
-    const translated = await translateOneLine({
-      line: lineText,
-      sourceLang,
-      targetLang,
-      groupId,
-      contextList,
-    });
-    outLines.push(translated);
+    result += text.slice(cursor, start);
+    const original = text.slice(start, end);
+    const ph = createPlaceholder('MENTION', idx++);
+    map[ph] = original;
+    result += ph;
+    cursor = end;
   }
 
-  let merged = outLines.join("\n");
-  merged = restorePlaceholders(merged, protectedPack.restoreMap);
-  merged = postNormalizeOutput(merged, sourceLang, targetLang);
-
-  return merged;
+  result += text.slice(cursor);
+  return { text: result, map };
 }
 
-async function translateOneLine({ line, sourceLang, targetLang, groupId, contextList }) {
-  if (line === "") return "";
+function protectEmojis(text) {
+  const emojiRegex = /(\p{Extended_Pictographic}(?:\uFE0F)?)/gu;
+  let idx = 0;
+  const map = {};
 
-  const trimmed = line.trim();
-  if (!trimmed) return "";
-
-  if (isCodeOnlyLine(trimmed)) return line;
-
-  // 先處理 1430/40/2300藍白色 UP 這類格式
-  if (sourceLang === "zh" && looksLikeCodePlusShortChinese(trimmed)) {
-    return translateCodePlusShortChineseLine(line, groupId);
-  }
-
-  // 一般 mixed 還是不翻
-  if (detectMainLanguage(trimmed) === "mixed") return line;
-
-  if (sourceLang === "zh" && targetLang === "th") {
-    const segments = splitChineseForTranslation(line);
-    if (!segments.length) return line;
-
-    const out = [];
-    for (const seg of segments) {
-      if (!seg) {
-        out.push(seg);
-        continue;
-      }
-
-      const segTrim = seg.trim();
-
-      if (isCodeOnlyLine(segTrim)) {
-        out.push(seg);
-        continue;
-      }
-
-      if (looksLikeCodePlusShortChinese(segTrim)) {
-        out.push(await translateCodePlusShortChineseLine(seg, groupId));
-        continue;
-      }
-
-      if (!containsChinese(seg)) {
-        out.push(seg);
-        continue;
-      }
-
-      const t = await callTranslator({
-        text: seg,
-        sourceLang,
-        targetLang,
-        contextList,
-        strictMode: "zh_to_th_segment",
-      });
-      out.push(t || seg);
-    }
-    return out.join("");
-  }
-
-  const t = await callTranslator({
-    text: line,
-    sourceLang,
-    targetLang,
-    contextList,
-    strictMode: "normal_line",
+  const out = text.replace(emojiRegex, (m) => {
+    const ph = createPlaceholder('EMOJI', idx++);
+    map[ph] = m;
+    return ph;
   });
 
-  return t || line;
+  return { text: out, map };
+}
+
+function protectUrls(text) {
+  const regex = /https?:\/\/[^\s]+/gi;
+  let idx = 0;
+  const map = {};
+
+  const out = text.replace(regex, (m) => {
+    const ph = createPlaceholder('URL', idx++);
+    map[ph] = m;
+    return ph;
+  });
+
+  return { text: out, map };
+}
+
+function protectAlwaysKeepWords(text) {
+  let out = text;
+  const map = {};
+  let idx = 0;
+
+  for (const word of ALWAYS_KEEP_WORDS) {
+    const re = new RegExp(`\\b${escapeRegExp(word)}\\b`, 'g');
+    out = out.replace(re, (m) => {
+      const ph = createPlaceholder('KEEP', idx++);
+      map[ph] = m;
+      return ph;
+    });
+  }
+
+  // 保護 1430/40/2300 這類型
+  out = out.replace(/\b\d+(?:\/\d+){1,}\b/g, (m) => {
+    const ph = createPlaceholder('CODE', idx++);
+    map[ph] = m;
+    return ph;
+  });
+
+  // 保護價格 / 房號 / 規格 / 貨號 / 尺寸代碼
+  out = out.replace(/\b(?:#?[A-Za-z]{1,6}\d{1,8}|\d{1,8}[A-Za-z]{1,6}|[A-Za-z]{1,6}-\d{1,8}|#?[A-Za-z0-9_-]{3,})\b/g, (m) => {
+    if (hasChinese(m) || hasThai(m)) return m;
+
+    // 一般英文單字不全部保護，避免像 mixed 這種失去翻譯機會
+    if (/^[A-Za-z]{3,}$/.test(m) && !ALWAYS_KEEP_WORDS.has(m.toUpperCase())) {
+      return m;
+    }
+
+    const ph = createPlaceholder('TOKEN', idx++);
+    map[ph] = m;
+    return ph;
+  });
+
+  return { text: out, map };
+}
+
+function protectText(text, mention) {
+  const p1 = protectMentions(text, mention);
+  const p2 = protectEmojis(p1.text);
+  const p3 = protectUrls(p2.text);
+  const p4 = protectAlwaysKeepWords(p3.text);
+
+  return {
+    text: p4.text,
+    map: {
+      ...p1.map,
+      ...p2.map,
+      ...p3.map,
+      ...p4.map,
+    },
+  };
+}
+
+function restorePlaceholders(text, map) {
+  let out = text || '';
+
+  for (let i = 0; i < 10; i++) {
+    let changed = false;
+    for (const [ph, original] of Object.entries(map)) {
+      if (out.includes(ph)) {
+        out = out.split(ph).join(original);
+        changed = true;
+      }
+    }
+    if (!changed) break;
+  }
+
+  return out;
+}
+
+// =========================
+// 字典
+// =========================
+function applyGlobalDictionaryBefore(text) {
+  let out = text;
+  for (const item of GLOBAL_DICTIONARY) {
+    if (!item || !item.from) continue;
+    const re = new RegExp(escapeRegExp(item.from), 'g');
+    out = out.replace(re, item.from);
+  }
+  return out;
+}
+
+function applyGlobalDictionaryAfter(text, targetLang) {
+  let out = text;
+  for (const item of GLOBAL_DICTIONARY) {
+    if (!item || !item.from) continue;
+
+    const replacement = targetLang === LANG_TH ? item.toTh : item.toZh;
+    if (!replacement) continue;
+
+    const re = new RegExp(escapeRegExp(item.from), 'g');
+    out = out.replace(re, replacement);
+  }
+  return out;
 }
 
 // =========================
 // OpenAI 翻譯
 // =========================
-async function callTranslator({ text, sourceLang, targetLang, contextList, strictMode }) {
-  const contextText = (contextList || [])
-    .slice(-3)
-    .map((x, i) => `${i + 1}. [${x.lang}] ${x.text}`)
-    .join("\n");
+function buildTranslationPrompt(sourceLang, targetLang) {
+  return `
+You are a high-accuracy chat translation engine.
 
-  const systemPrompt = buildSystemPrompt({ sourceLang, targetLang, strictMode });
+Task:
+Translate the user's message from ${sourceLang} into ${targetLang}.
 
-  const userPrompt = [
-    "請直接輸出翻譯結果，不要解釋，不要加引號，不要加前綴。",
-    "規則：",
-    "1. 不可漏翻後半句。",
-    "2. 不可只翻前面幾個字。",
-    "3. 不可把型號、數字、價格、時間、斜線代碼亂解釋。",
-    "4. 任何 __PH_xxx__ 佔位符都必須原樣保留。",
-    "5. 保持原本多行格式與行數。",
-    "6. 若該片段是代碼或不需翻譯，請原樣保留。",
-    "",
-    "最近上下文（只供理解語氣，不可把上下文混入結果）：",
-    contextText || "無",
-    "",
-    "原文：",
-    text
-  ].join("\n");
+Critical rules:
+1. Preserve placeholders exactly, including [[[MENTION_0]]], [[[EMOJI_0]]], [[[URL_0]]], [[[KEEP_0]]], [[[CODE_0]]], [[[TOKEN_0]]].
+2. Never translate or alter placeholders.
+3. Translate only the natural-language parts.
+4. Mixed strings like "1430/40/2300藍白色 [[[KEEP_0]]] mixed" must still be translated for the human-language parts.
+5. Preserve codes, IDs, room numbers, stock/spec strings, slash-separated numbers, and protected English tokens.
+6. Keep line breaks as much as possible.
+7. Do not add explanations, notes, quotation marks, labels, or extra text.
+8. Return only the translated text.
+9. If the source message is already mostly in the target language but still includes source-language fragments, translate those fragments and keep the rest natural.
+10. Keep chat tone natural.
 
-  try {
-    const resp = await openai.chat.completions.create({
-      model: OPENAI_MODEL,
-      temperature: 0.15,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt }
-      ]
-    });
-
-    const out = resp?.choices?.[0]?.message?.content?.trim() || "";
-    return cleanupModelOutput(out);
-  } catch (err) {
-    console.error("OpenAI translate error:", err?.message || err);
-    return text;
-  }
+Examples:
+- "1430/40/2300藍白色 [[[KEEP_0]]] mixed" -> keep 1430/40/2300 and [[[KEEP_0]]] exactly, translate 藍白色 and mixed appropriately.
+- Thai sentence -> Chinese.
+- Chinese sentence -> Thai.
+`.trim();
 }
 
-function buildSystemPrompt({ sourceLang, targetLang, strictMode }) {
-  const common = `
-你是專業翻譯器。
-你只能做忠實、自然、完整的翻譯。
-不可總結，不可解釋，不可擴寫，不可腦補。
+async function translateWithOpenAI(protectedText, sourceLang, targetLang) {
+  const systemPrompt = buildTranslationPrompt(sourceLang, targetLang);
 
-重要規則：
-- 純數字、型號、時間、價格、斜線代碼、英數代碼要原樣保留。
-- 任何 __PH_xxx__ 佔位符都必須原樣保留。
-- 多行內容必須維持原本行數，不可合併成一行。
-- 若句子中有代碼與短詞，僅翻短詞，不得亂解釋代碼。
-- 不可只翻前半句。
-`;
-
-  const zhToTh = `
-中文 -> 泰文要求：
-- 使用自然泰文口語，但不要過度潤飾。
-- 顏色、尺寸、狀態詞要忠實翻譯。
-- 分段翻譯時，每段都要完整翻譯。
-`;
-
-  const thToZh = `
-泰文 -> 中文要求：
-- 譯成自然繁體中文口語。
-- 口語句型要正確理解。
-`;
-
-  const enToZh = `
-英文 -> 中文要求：
-- 譯成自然繁體中文。
-- 短句不要過度書面。
-- 保留代碼與保留字。
-`;
-
-  const myToZh = `
-緬文 -> 中文要求：
-- 譯成自然繁體中文。
-- 保留代碼、型號、數字。
-`;
-
-  const zhToMy = `
-中文 -> 緬文要求：
-- 忠實簡潔，不可擴寫。
-- 保留型號、數字、代碼。
-`;
-
-  const normalLine = `
-現在輸入是一行或一段原文，只能輸出翻譯結果。
-`;
-
-  const zhSeg = `
-現在輸入只是中文片段。
-你只能翻譯這個片段，不可遺漏，也不可補整句。
-`;
-
-  let prompt = common;
-  if (sourceLang === "zh" && targetLang === "th") prompt += zhToTh;
-  if (sourceLang === "th" && targetLang === "zh") prompt += thToZh;
-  if (sourceLang === "en" && targetLang === "zh") prompt += enToZh;
-  if (sourceLang === "my" && targetLang === "zh") prompt += myToZh;
-  if (sourceLang === "zh" && targetLang === "my") prompt += zhToMy;
-  if (strictMode === "zh_to_th_segment") prompt += zhSeg;
-  else prompt += normalLine;
-
-  return prompt.trim();
-}
-
-// =========================
-// mention 處理
-// =========================
-function extractMentionInfo(text) {
-  const original = String(text || "");
-  const mentionRegex = /@\S+/g;
-  const mentions = original.match(mentionRegex) || [];
-
-  let cleanText = original.replace(mentionRegex, " ");
-  cleanText = cleanText.replace(/\s+/g, " ").trim();
-
-  return {
-    original,
-    mentions,
-    cleanText
-  };
-}
-
-function rebuildMentionText(mentionInfo, translatedText) {
-  const translated = String(translatedText || "").trim();
-  const mentions = mentionInfo?.mentions || [];
-
-  if (!translated) return "";
-  if (!mentions.length) return translated;
-
-  return `${mentions.join(" ")} ${translated}`.trim();
-}
-
-// =========================
-// 保護
-// =========================
-function protectAll(text, groupId) {
-  let out = text;
-  const restoreMap = {};
-  let idx = 0;
-
-  const keepWords = getAllKeepWords(groupId).sort((a, b) => b.length - a.length);
-  const dict = getMergedDict(groupId);
-  const dictEntries = Object.entries(dict).sort((a, b) => b[0].length - a[0].length);
-
-  for (const [source, target] of dictEntries) {
-    if (!source) continue;
-    const ph = `__PH_DICT_${idx++}__`;
-    const re = new RegExp(escapeRegExp(source), "g");
-    if (re.test(out)) {
-      out = out.replace(re, ph);
-      restoreMap[ph] = target;
-    }
-  }
-
-  for (const word of keepWords) {
-    if (!word) continue;
-    const ph = `__PH_KEEP_${idx++}__`;
-    const re = new RegExp(`\\b${escapeRegExp(word)}\\b`, "g");
-    if (re.test(out)) {
-      out = out.replace(re, ph);
-      restoreMap[ph] = word;
-    }
-  }
-
-  out = out.replace(/@\S+/g, (m) => {
-    const ph = `__PH_AT_${idx++}__`;
-    restoreMap[ph] = m;
-    return ph;
+  const response = await openai.chat.completions.create({
+    model: OPENAI_MODEL,
+    temperature: 0.1,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: protectedText },
+    ],
   });
 
-  out = out.replace(/[\p{Extended_Pictographic}\u2600-\u27BF]/gu, (m) => {
-    const ph = `__PH_EMJ_${idx++}__`;
-    restoreMap[ph] = m;
-    return ph;
-  });
-
-  return { text: out, restoreMap };
+  return response.choices?.[0]?.message?.content?.trim() || '';
 }
 
-function getAllKeepWords(groupId) {
-  const groupKeep = db.groups[groupId]?.keepWords || [];
-  return [...new Set([...DEFAULT_KEEP_WORDS, ...(db.globalKeepWords || []), ...groupKeep])];
-}
+async function translateText(text, mention) {
+  const normalized = normalizeText(text);
+  if (!shouldTranslateText(normalized)) return null;
 
-function getMergedDict(groupId) {
-  return {
-    ...(db.globalDict || {}),
-    ...((db.groups[groupId]?.dict) || {})
-  };
-}
+  const direction = detectTranslationDirection(normalized);
+  if (!direction) return null;
 
-function restorePlaceholders(text, restoreMap) {
-  let out = text;
-  const entries = Object.entries(restoreMap).sort((a, b) => b[0].length - a[0].length);
-  for (const [ph, val] of entries) {
-    out = out.split(ph).join(val);
-  }
-  return out;
-}
+  const beforeDict = applyGlobalDictionaryBefore(normalized);
+  const protectedPack = protectText(beforeDict, mention);
 
-// =========================
-// 特殊格式翻譯
-// =========================
-function splitChineseForTranslation(line) {
-  const parts = line.split(/([，。！？；：,.!?;:])/);
-  const out = [];
-
-  for (let i = 0; i < parts.length; i++) {
-    const cur = parts[i];
-    if (cur == null || cur === "") continue;
-    const next = parts[i + 1];
-    if (next && /^[，。！？；：,.!?;:]$/.test(next)) {
-      out.push(cur + next);
-      i++;
-    } else {
-      out.push(cur);
-    }
-  }
-
-  return out;
-}
-
-function looksLikeCodePlusShortChinese(text) {
-  return /^([A-Za-z0-9/._:+\- ]*)([\u4e00-\u9fff]{1,8})([A-Za-z0-9/._:+\- ]*)$/.test(text);
-}
-
-async function translateCodePlusShortChineseLine(line, groupId) {
-  const match = line.match(/^([A-Za-z0-9/._:+\- ]*)([\u4e00-\u9fff]{1,8})([A-Za-z0-9/._:+\- ]*)$/);
-  if (!match) return line;
-
-  const prefix = match[1] || "";
-  const zhPart = match[2] || "";
-  const suffix = match[3] || "";
-
-  const dict = getMergedDict(groupId);
-  if (dict[zhPart]) return `${prefix}${dict[zhPart]}${suffix}`;
-
-  const quick = quickShortZhToTh(zhPart);
-  if (quick) return `${prefix}${quick}${suffix}`;
-
-  const translated = await callTranslator({
-    text: zhPart,
-    sourceLang: "zh",
-    targetLang: "th",
-    contextList: [],
-    strictMode: "zh_to_th_segment"
-  });
-
-  return `${prefix}${(translated || zhPart).trim()}${suffix}`;
-}
-
-function quickShortZhToTh(zh) {
-  const map = {
-    "灰色": "สีเทา",
-    "白色": "สีขาว",
-    "黑色": "สีดำ",
-    "紅色": "สีแดง",
-    "藍色": "สีน้ำเงิน",
-    "綠色": "สีเขียว",
-    "黃色": "สีเหลือง",
-    "粉色": "สีชมพู",
-    "紫色": "สีม่วง",
-    "棕色": "สีน้ำตาล",
-    "咖啡色": "สีน้ำตาล",
-    "橘色": "สีส้ม",
-    "銀色": "สีเงิน",
-    "金色": "สีทอง",
-    "藍白色": "สีน้ำเงินขาว",
-    "黑白色": "สีดำขาว",
-    "紅白色": "สีแดงขาว",
-    "藍黑色": "สีน้ำเงินดำ",
-    "客人時間": "เวลาลูกค้า",
-    "今天": "วันนี้",
-    "明天": "พรุ่งนี้",
-    "後天": "มะรืนนี้",
-    "早上": "ตอนเช้า",
-    "中午": "ตอนเที่ยง",
-    "下午": "ตอนบ่าย",
-    "晚上": "ตอนเย็น",
-    "有": "มี",
-    "沒有": "ไม่มี",
-    "好了": "ได้แล้ว",
-    "可以": "ได้",
-    "要": "เอา",
-    "不要": "ไม่เอา",
-    "出去": "ออกไป"
-  };
-  return map[zh] || null;
-}
-
-// =========================
-// 語言判斷
-// =========================
-function detectMainLanguage(text) {
-  const zh = countMatch(text, /[\u4e00-\u9fff]/g);
-  const th = countMatch(text, /[\u0E00-\u0E7F]/g);
-  const my = countMatch(text, /[\u1000-\u109F\uA9E0-\uA9FF\uAA60-\uAA7F]/g);
-  const en = countEnglishLetters(text);
-
-  const present = [
-    zh > 0 ? "zh" : null,
-    th > 0 ? "th" : null,
-    my > 0 ? "my" : null,
-    en > 0 ? "en" : null,
-  ].filter(Boolean);
-
-  if (present.length >= 2) return "mixed";
-  if (zh > 0) return "zh";
-  if (th > 0) return "th";
-  if (my > 0) return "my";
-  if (en > 0) return "en";
-  return "other";
-}
-
-function countMatch(text, regex) {
-  const m = text.match(regex);
-  return m ? m.length : 0;
-}
-
-function countEnglishLetters(text) {
-  const m = text.match(/[A-Za-z]/g);
-  return m ? m.length : 0;
-}
-
-function containsChinese(text) {
-  return /[\u4e00-\u9fff]/.test(text);
-}
-
-// =========================
-// 上下文
-// =========================
-function getChatKey(source) {
-  if (!source) return "unknown";
-  if (source.type === "group") return `group:${source.groupId}`;
-  if (source.type === "room") return `room:${source.roomId}`;
-  return `user:${source.userId || "unknown"}`;
-}
-
-function getRecentContext(chatKey, limit = 3) {
-  const arr = db.contexts[chatKey] || [];
-  return arr.slice(-limit);
-}
-
-function pushContext(chatKey, item) {
-  if (!db.contexts[chatKey]) db.contexts[chatKey] = [];
-  db.contexts[chatKey].push({
-    role: item.role,
-    text: item.text,
-    lang: item.lang,
-    ts: Date.now(),
-  });
-
-  if (db.contexts[chatKey].length > 20) {
-    db.contexts[chatKey] = db.contexts[chatKey].slice(-20);
-  }
-
-  saveDb();
-}
-
-// =========================
-// 後處理
-// =========================
-function postNormalizeOutput(text, sourceLang, targetLang) {
-  let out = cleanupModelOutput(text);
-
-  if (sourceLang === "th" && targetLang === "zh") {
-    out = out.replace(/นะค่ะ/g, "นะคะ");
-  }
-
-  if (sourceLang === "zh" && targetLang === "th") {
-    out = out.replace(/นะค่ะ/g, "นะคะ");
-  }
-
-  return out;
-}
-
-function cleanupModelOutput(text) {
-  let out = (text || "").trim();
-
-  out = out
-    .replace(/^```(?:text)?/i, "")
-    .replace(/```$/i, "")
-    .trim();
-
-  out = out.replace(/^(翻譯：|譯文：|Translation:|คำแปล:)\s*/i, "");
-  return out.trim();
-}
-
-// =========================
-// 判斷工具
-// =========================
-function isCodeOnlyLine(text) {
-  if (!text) return false;
-
-  const patterns = [
-    /^[0-9\s/.:+\-]+$/,
-    /^[A-Za-z0-9\s/._:+\-]+$/,
-    /^[0-9]{1,2}\/[0-9]{1,2}\s*$/,
-    /^[0-9]{3,4}\s*$/,
-    /^[0-9]{1,2}:[0-9]{2}\s*$/,
-    /^[0-9/]+\s*$/
-  ];
-
-  return patterns.some((p) => p.test(text));
-}
-
-function isSupportedLang(lang) {
-  return ["zh", "th", "en", "my"].includes(lang);
-}
-
-function langLabel(lang) {
-  const map = {
-    zh: "中文",
-    th: "泰文",
-    en: "英文",
-    my: "緬甸文"
-  };
-  return map[lang] || lang;
-}
-
-function isAdmin(userId) {
-  return !!ADMIN_USER_ID && userId === ADMIN_USER_ID;
-}
-
-function shouldDebugEvent(event) {
-  if (!DEBUG_WEBHOOK) return false;
-  if (!DEBUG_GROUP_ID) return true;
-  return event?.source?.groupId === DEBUG_GROUP_ID;
-}
-
-// =========================
-// LINE 訊息工具
-// =========================
-async function safeReply(replyToken, text) {
-  try {
-    return await client.replyMessage(replyToken, {
-      type: "text",
-      text: truncateText(String(text || ""), 4900)
-    });
-  } catch (err) {
-    console.error("reply message failed:", err?.message || err);
+  // 只要有中文或泰文，絕不因代碼混合而跳過
+  if (!hasChinese(normalized) && !hasThai(normalized) && shouldSkipBecausePureCode(protectedPack.text)) {
     return null;
   }
-}
 
-async function safeReplyFlex(replyToken, bubble) {
-  try {
-    return await client.replyMessage(replyToken, {
-      type: "flex",
-      altText: "操作面板",
-      contents: bubble
-    });
-  } catch (err) {
-    console.error("reply flex failed:", err?.message || err);
-    return null;
-  }
-}
+  const translatedProtected = await translateWithOpenAI(
+    protectedPack.text,
+    direction.sourceLang,
+    direction.targetLang
+  );
 
-async function safePushFlex(to, bubble) {
-  try {
-    return await client.pushMessage(to, {
-      type: "flex",
-      altText: "群組授權",
-      contents: bubble
-    });
-  } catch (err) {
-    console.error("push flex failed:", err?.message || err);
-    return null;
-  }
-}
+  if (!translatedProtected) return null;
 
-function truncateText(text, maxLen) {
-  const s = String(text || "");
-  if (s.length <= maxLen) return s;
-  return s.slice(0, maxLen - 20) + "\n...[truncated]";
+  let restored = restorePlaceholders(translatedProtected, protectedPack.map);
+  restored = applyGlobalDictionaryAfter(restored, direction.targetLang);
+
+  restored = restored.trim();
+  if (!restored) return null;
+
+  return restored;
 }
 
 // =========================
-// 檔案 / DB
+// 事件處理
 // =========================
-function ensureDir(dir) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-}
+async function handleTextMessage(event) {
+  const msg = event.message;
+  const originalText = msg.text || '';
 
-function loadJson(file, fallback) {
-  try {
-    ensureDir(path.dirname(file));
+  if (!isAllowedSource(event)) {
+    return client.replyMessage(event.replyToken, {
+      type: 'text',
+      text: '此群組/聊天室尚未授權使用翻譯機器人。',
+    });
+  }
 
-    if (!fs.existsSync(file)) {
-      fs.writeFileSync(file, JSON.stringify(fallback, null, 2), "utf8");
-      console.log(`初始化資料檔: ${file}`);
-      return fallback;
+  if (isCommand(originalText)) {
+    const t = normalizeText(originalText).toLowerCase();
+
+    if (t === '/ping' || t === '!ping') {
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: 'pong',
+      });
     }
 
-    const raw = fs.readFileSync(file, "utf8");
-    return JSON.parse(raw);
-  } catch (err) {
-    console.error(`讀取 JSON 失敗: ${file}`, err);
-    return fallback;
+    if (t === '/id' || t === '!id') {
+      const source = event.source || {};
+      const sourceId = source.groupId || source.roomId || source.userId || 'unknown';
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: `sourceId: ${sourceId}`,
+      });
+    }
+
+    if (t === '/help' || t === '!help') {
+      return client.replyMessage(event.replyToken, {
+        type: 'text',
+        text:
+`可用指令：
+/help
+/ping
+/id
+
+目前功能：
+- 中文 → 泰文
+- 泰文 → 中文
+- mention 保留
+- sticker 不翻
+- emoji 保留
+- URL 保留
+- 1430/40/2300藍白色 UP mixed 這類混合字串可翻
+- 指令不誤判`,
+      });
+    }
+
+    return null;
   }
+
+  const translated = await translateText(originalText, msg.mention);
+
+  if (!translated) return null;
+  if (translated === normalizeText(originalText)) return null;
+
+  return client.replyMessage(event.replyToken, {
+    type: 'text',
+    text: translated,
+  });
 }
 
-function saveDb() {
+async function handleEvent(event) {
   try {
-    ensureDir(path.dirname(DB_FILE));
-    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2), "utf8");
+    if (event.type !== 'message') return null;
+
+    // sticker / image / video / audio / file 不翻
+    if (event.message.type !== 'text') return null;
+
+    return await handleTextMessage(event);
   } catch (err) {
-    console.error("寫入 db.json 失敗:", err);
+    console.error('handleEvent error:', err);
+
+    try {
+      return await client.replyMessage(event.replyToken, {
+        type: 'text',
+        text: '翻譯時發生錯誤，請稍後再試。',
+      });
+    } catch (replyErr) {
+      console.error('reply error:', replyErr);
+      return null;
+    }
   }
 }
 
-function escapeRegExp(str) {
-  return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
+// =========================
+// 路由
+// =========================
+app.get('/', (req, res) => {
+  res.status(200).send('OK');
+});
+
+app.get('/health', (req, res) => {
+  res.status(200).json({ ok: true });
+});
+
+app.post('/webhook', line.middleware(config), async (req, res) => {
+  try {
+    const events = req.body.events || [];
+    await Promise.all(events.map(handleEvent));
+    res.status(200).send('OK');
+  } catch (err) {
+    console.error('webhook error:', err);
+    res.status(500).send('Internal Server Error');
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`✅ LINE bot server running on port ${PORT}`);
+});
