@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * LINE 翻譯機器人 v6.5 UI 一鍵批准版
+ * LINE 翻譯機器人 v6.5 Persistent Disk 完整版
  */
 
 const fs = require("fs");
@@ -16,6 +16,13 @@ const OpenAI = require("openai");
 const PORT = process.env.PORT || 3000;
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 const ADMIN_USER_ID = process.env.ADMIN_USER_ID || "";
+const DEBUG_WEBHOOK = process.env.DEBUG_WEBHOOK === "true";
+const DEBUG_GROUP_ID = process.env.DEBUG_GROUP_ID || "";
+
+// Persistent Disk 路徑
+// Render Disk mount path 建議設 /var/data
+const DATA_DIR = process.env.DATA_DIR || "/var/data";
+const DB_FILE = path.join(DATA_DIR, "db.json");
 
 const config = {
   channelAccessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN,
@@ -34,10 +41,10 @@ const app = express();
 // =========================
 // 資料檔
 // =========================
-const DATA_DIR = path.join(__dirname, "data");
-const DB_FILE = path.join(DATA_DIR, "db.json");
-
 ensureDir(DATA_DIR);
+
+console.log("📦 DATA_DIR =", DATA_DIR);
+console.log("📦 DB_FILE =", DB_FILE);
 
 const db = loadJson(DB_FILE, {
   allowGroups: {},
@@ -57,12 +64,42 @@ const DEFAULT_KEEP_WORDS = [
 // 啟動
 // =========================
 app.get("/", (req, res) => {
-  res.status(200).send("LINE Translator Bot v6.5 UI approve running");
+  res.status(200).send("LINE Translator Bot v6.5 Persistent Disk running");
+});
+
+app.get("/healthz", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    dataDir: DATA_DIR,
+    dbFile: DB_FILE,
+    time: new Date().toISOString(),
+    debugWebhook: DEBUG_WEBHOOK
+  });
 });
 
 app.post("/webhook", line.middleware(config), async (req, res) => {
   try {
-    await Promise.all(req.body.events.map(handleEvent));
+    const events = Array.isArray(req.body?.events) ? req.body.events : [];
+
+    console.log(`📨 webhook hit: ${events.length}`);
+
+    if (DEBUG_WEBHOOK) {
+      for (const [i, event] of events.entries()) {
+        if (!shouldDebugEvent(event)) continue;
+        console.log("🔍 event detail:", JSON.stringify({
+          index: i,
+          type: event?.type,
+          sourceType: event?.source?.type,
+          groupId: event?.source?.groupId || "",
+          roomId: event?.source?.roomId || "",
+          userId: event?.source?.userId || "",
+          messageType: event?.message?.type || "",
+          text: event?.message?.text || ""
+        }));
+      }
+    }
+
+    await Promise.all(events.map(handleEvent));
     res.status(200).end();
   } catch (err) {
     console.error("Webhook error:", err);
@@ -70,7 +107,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
 });
 
@@ -79,6 +116,17 @@ app.listen(PORT, () => {
 // =========================
 async function handleEvent(event) {
   try {
+    if (DEBUG_WEBHOOK && shouldDebugEvent(event)) {
+      console.log("🧩 handleEvent:", JSON.stringify({
+        type: event?.type,
+        sourceType: event?.source?.type,
+        groupId: event?.source?.groupId || "",
+        userId: event?.source?.userId || "",
+        messageType: event?.message?.type || "",
+        text: event?.message?.text || ""
+      }));
+    }
+
     const source = event.source || {};
     const sourceType = source.type || "";
     const groupId = source.groupId || "";
@@ -273,6 +321,27 @@ async function handleCommand(event, text, groupId, userId) {
     );
   }
 
+  if (lower === "/whoami") {
+    return safeReply(event.replyToken, [
+      `groupId: ${groupId || ""}`,
+      `userId: ${userId || ""}`,
+      `isAdmin: ${isAdmin(userId)}`
+    ].join("\n"));
+  }
+
+  if (lower === "/status") {
+    initGroupSettings(groupId);
+    const allowed = !!db.allowGroups[groupId];
+    const g = db.groups[groupId] || {};
+    return safeReply(event.replyToken, [
+      `群組授權：${allowed ? "已授權" : "未授權"}`,
+      `翻譯：${g.enable ? "開啟" : "關閉"}`,
+      `語言：${langLabel(g.langA || "zh")} ⇄ ${langLabel(g.langB || "th")}`,
+      `英文自動翻中：${g.englishAutoZh ? "開啟" : "關閉"}`,
+      `DATA_DIR：${DATA_DIR}`
+    ].join("\n"));
+  }
+
   // 只處理 / 指令
   if (!text.startsWith("/")) return null;
 
@@ -357,6 +426,8 @@ async function handleCommand(event, text, groupId, userId) {
         "/lang",
         "/on",
         "/off",
+        "/status",
+        "/whoami",
       ].join("\n")
     );
   }
@@ -548,9 +619,9 @@ async function translateMessage({ text, sourceLang, targetLang, groupId, context
   const lines = protectedText.split(/\r?\n/);
   const outLines = [];
 
-  for (const line of lines) {
+  for (const lineText of lines) {
     const translated = await translateOneLine({
-      line,
+      line: lineText,
       sourceLang,
       targetLang,
       groupId,
@@ -1042,67 +1113,61 @@ function isAdmin(userId) {
   return !!ADMIN_USER_ID && userId === ADMIN_USER_ID;
 }
 
+function shouldDebugEvent(event) {
+  if (!DEBUG_WEBHOOK) return false;
+  if (!DEBUG_GROUP_ID) return true;
+  return event?.source?.groupId === DEBUG_GROUP_ID;
+}
+
 // =========================
-// LINE 回覆
+// LINE 訊息工具
 // =========================
 async function safeReply(replyToken, text) {
-  if (!replyToken || !text) return null;
-
-  const max = 4500;
-  if (text.length <= max) {
-    return client.replyMessage(replyToken, { type: "text", text });
-  }
-
-  const chunks = splitLongText(text, max);
-  return client.replyMessage(
-    replyToken,
-    chunks.slice(0, 5).map((chunk) => ({ type: "text", text: chunk }))
-  );
-}
-
-async function safeReplyFlex(replyToken, flexContents) {
-  if (!replyToken || !flexContents) return null;
-  return client.replyMessage(replyToken, {
-    type: "flex",
-    altText: "控制面板",
-    contents: flexContents
-  });
-}
-
-async function safePushFlex(groupId, flexContents) {
-  if (!groupId || !flexContents) return null;
   try {
-    return await client.pushMessage(groupId, {
-      type: "flex",
-      altText: "群組授權",
-      contents: flexContents
+    return await client.replyMessage(replyToken, {
+      type: "text",
+      text: truncateText(String(text || ""), 4900)
     });
   } catch (err) {
-    console.error("push message failed:", err?.message || err);
+    console.error("reply message failed:", err?.message || err);
     return null;
   }
 }
 
-function splitLongText(text, maxLen) {
-  const lines = text.split("\n");
-  const chunks = [];
-  let cur = "";
-
-  for (const line of lines) {
-    if ((cur + "\n" + line).length > maxLen) {
-      if (cur) chunks.push(cur);
-      cur = line;
-    } else {
-      cur = cur ? `${cur}\n${line}` : line;
-    }
+async function safeReplyFlex(replyToken, bubble) {
+  try {
+    return await client.replyMessage(replyToken, {
+      type: "flex",
+      altText: "操作面板",
+      contents: bubble
+    });
+  } catch (err) {
+    console.error("reply flex failed:", err?.message || err);
+    return null;
   }
+}
 
-  if (cur) chunks.push(cur);
-  return chunks;
+async function safePushFlex(to, bubble) {
+  try {
+    return await client.pushMessage(to, {
+      type: "flex",
+      altText: "群組授權",
+      contents: bubble
+    });
+  } catch (err) {
+    console.error("push flex failed:", err?.message || err);
+    return null;
+  }
+}
+
+function truncateText(text, maxLen) {
+  const s = String(text || "");
+  if (s.length <= maxLen) return s;
+  return s.slice(0, maxLen - 20) + "\n...[truncated]";
 }
 
 // =========================
-// 檔案工具
+// 檔案 / DB
 // =========================
 function ensureDir(dir) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -1110,7 +1175,14 @@ function ensureDir(dir) {
 
 function loadJson(file, fallback) {
   try {
-    if (!fs.existsSync(file)) return fallback;
+    ensureDir(path.dirname(file));
+
+    if (!fs.existsSync(file)) {
+      fs.writeFileSync(file, JSON.stringify(fallback, null, 2), "utf8");
+      console.log(`初始化資料檔: ${file}`);
+      return fallback;
+    }
+
     const raw = fs.readFileSync(file, "utf8");
     return JSON.parse(raw);
   } catch (err) {
@@ -1121,6 +1193,7 @@ function loadJson(file, fallback) {
 
 function saveDb() {
   try {
+    ensureDir(path.dirname(DB_FILE));
     fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2), "utf8");
   } catch (err) {
     console.error("寫入 db.json 失敗:", err);
@@ -1128,5 +1201,5 @@ function saveDb() {
 }
 
 function escapeRegExp(str) {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
