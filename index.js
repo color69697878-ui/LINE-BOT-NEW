@@ -29,7 +29,9 @@ const openai = new OpenAI({
 });
 
 const PORT = Number(process.env.PORT || 3000);
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
+
+// 建議正式使用 gpt-4.1，翻譯品質明顯比 mini 穩定
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1';
 
 // =====================================================
 // 授權 / 管理設定
@@ -82,6 +84,7 @@ const ALWAYS_KEEP_WORDS = new Set([
 ]);
 
 const GLOBAL_DICTIONARY = [
+  // 可自行增加常用詞
   // {
   //   from: '藍白色',
   //   toZh: '藍白色',
@@ -130,6 +133,7 @@ function loadAuthStore() {
 
   if (!initial || typeof initial !== 'object' || !initial.sources || typeof initial.sources !== 'object') {
     const fresh = { sources: {} };
+
     for (const sourceId of SEED_ALLOWED_SOURCE_IDS) {
       fresh.sources[sourceId] = {
         authorized: true,
@@ -138,6 +142,7 @@ function loadAuthStore() {
         note: 'seed from env',
       };
     }
+
     writeJsonSafe(AUTH_FILE, fresh);
     return fresh;
   }
@@ -286,6 +291,7 @@ function unauthorizeSource(sourceId) {
     authStore.sources[sourceId].updatedAt = new Date().toISOString();
     authStore.sources[sourceId].note = 'manual unauth';
   }
+
   writeJsonSafe(AUTH_FILE, authStore);
 }
 
@@ -324,7 +330,9 @@ function modeDisplayName(mode) {
 function containsEnoughHumanText(text) {
   if (!text) return false;
   if (hasChinese(text) || hasThai(text) || hasMyanmar(text)) return true;
-  return countEnglishWords(text) >= 2;
+
+  // 英文單字 1 個也允許翻譯，避免短英文不翻
+  return countEnglishWords(text) >= 1;
 }
 
 function shouldSkipBecausePureCode(text) {
@@ -333,10 +341,12 @@ function shouldSkipBecausePureCode(text) {
   const stripped = text.replace(/\s+/g, '');
   if (!stripped) return true;
 
-  if (/^[A-Za-z0-9\-_/.:#+()&\[\]%]+$/.test(stripped)) {
-    const words = text.match(/[A-Za-z]+/g) || [];
-    if (words.length <= 2) return true;
-  }
+  // 純網址、純代碼、純符號才跳過
+  if (/^[0-9\-_/.:#+()&\[\]%]+$/.test(stripped)) return true;
+
+  // 單一很短英文代碼，例如 A1、B2、AB123
+  if (/^#?[A-Za-z]{1,4}\d{1,10}$/.test(stripped)) return true;
+  if (/^\d{1,10}[A-Za-z]{1,4}$/.test(stripped)) return true;
 
   return false;
 }
@@ -356,15 +366,18 @@ function isLikelyUntranslated(originalText, translatedText, targetLang) {
   const translated = normalizeText(translatedText);
 
   if (!original || !translated) return false;
-  if (original === translated) return true;
+
+  // 短字詞可能本來就是品牌、代碼，不要太容易重試
+  if (original === translated && original.length > 8) return true;
 
   if (targetLang === '繁體中文') {
     if ((hasThai(translated) || hasMyanmar(translated)) && !hasChinese(translated)) return true;
-    if (hasEnglish(original) && translated === original) return true;
+    if (hasEnglish(original) && translated === original && original.length > 8) return true;
   }
 
   if (targetLang === 'ไทย') {
     if (hasChinese(translated) && !hasThai(translated)) return true;
+    if (hasEnglish(original) && translated === original && original.length > 8) return true;
   }
 
   if (targetLang === 'English') {
@@ -373,6 +386,7 @@ function isLikelyUntranslated(originalText, translatedText, targetLang) {
 
   if (targetLang === 'မြန်မာဘာသာ') {
     if (hasChinese(translated) && !hasMyanmar(translated)) return true;
+    if (hasEnglish(original) && translated === original && original.length > 8) return true;
   }
 
   return false;
@@ -450,7 +464,7 @@ function protectAlwaysKeepWords(text) {
   let idx = 0;
 
   for (const word of ALWAYS_KEEP_WORDS) {
-    const re = new RegExp(`\\b${escapeRegExp(word)}\\b`, 'g');
+    const re = new RegExp(`\\b${escapeRegExp(word)}\\b`, 'gi');
     out = out.replace(re, (m) => {
       const ph = createPlaceholder('KEEP', idx++);
       map[ph] = m;
@@ -458,18 +472,16 @@ function protectAlwaysKeepWords(text) {
     });
   }
 
+  // 保護 1430/40/2300 這種規格碼
   out = out.replace(/\b\d+(?:\/\d+){1,}\b/g, (m) => {
     const ph = createPlaceholder('CODE', idx++);
     map[ph] = m;
     return ph;
   });
 
-  out = out.replace(/\b(?:#?[A-Za-z]{1,6}\d{1,10}|\d{1,10}[A-Za-z]{1,6}|[A-Za-z]{1,6}-\d{1,10}|#?[A-Za-z0-9_-]{3,})\b/g, (m) => {
+  // 只保護明顯代碼，不再過度保護普通英文單字
+  out = out.replace(/\b(?:#?[A-Za-z]{1,6}\d{1,10}|\d{1,10}[A-Za-z]{1,6}|[A-Za-z]{1,6}-\d{1,10})\b/g, (m) => {
     if (hasChinese(m) || hasThai(m) || hasMyanmar(m)) return m;
-
-    if (/^[A-Za-z]{3,}$/.test(m) && !ALWAYS_KEEP_WORDS.has(m.toUpperCase())) {
-      return m;
-    }
 
     const ph = createPlaceholder('TOKEN', idx++);
     map[ph] = m;
@@ -501,12 +513,14 @@ function restorePlaceholders(text, map) {
 
   for (let i = 0; i < 10; i++) {
     let changed = false;
+
     for (const [ph, original] of Object.entries(map)) {
       if (out.includes(ph)) {
         out = out.split(ph).join(original);
         changed = true;
       }
     }
+
     if (!changed) break;
   }
 
@@ -518,16 +532,19 @@ function restorePlaceholders(text, map) {
 // =====================================================
 function applyGlobalDictionaryBefore(text) {
   let out = text;
+
   for (const item of GLOBAL_DICTIONARY) {
     if (!item || !item.from) continue;
     const re = new RegExp(escapeRegExp(item.from), 'g');
     out = out.replace(re, item.from);
   }
+
   return out;
 }
 
 function applyGlobalDictionaryAfter(text, targetLang) {
   let out = text;
+
   for (const item of GLOBAL_DICTIONARY) {
     if (!item || !item.from) continue;
 
@@ -542,6 +559,7 @@ function applyGlobalDictionaryAfter(text, targetLang) {
     const re = new RegExp(escapeRegExp(item.from), 'g');
     out = out.replace(re, replacement);
   }
+
   return out;
 }
 
@@ -564,7 +582,11 @@ function detectTranslationDirection(text, mode) {
   if (m === 'zh-th') {
     if (zh && !th) return { sourceLang: '繁體中文', targetLang: 'ไทย' };
     if (th && !zh) return { sourceLang: 'ไทย', targetLang: '繁體中文' };
-    if (en && !zh && !th && !my) return { sourceLang: 'English', targetLang: '繁體中文' };
+
+    // 優化：中泰模式下，純英文改翻泰文
+    if (en && !zh && !th && !my) {
+      return { sourceLang: 'English', targetLang: 'ไทย' };
+    }
 
     if (zh && th) {
       if (zhCount >= thCount) return { sourceLang: '繁體中文（含部分ไทย）', targetLang: 'ไทย' };
@@ -602,6 +624,8 @@ function detectTranslationDirection(text, mode) {
   if (m === 'zh-my') {
     if (zh && !my) return { sourceLang: '繁體中文', targetLang: 'မြန်မာဘာသာ' };
     if (my && !zh) return { sourceLang: 'မြန်မာဘာသာ', targetLang: '繁體中文' };
+
+    // 中緬模式下，純英文維持翻中文
     if (en && !zh && !my && !th) return { sourceLang: 'English', targetLang: '繁體中文' };
 
     if (zh && my) {
@@ -628,46 +652,52 @@ function detectTranslationDirection(text, mode) {
 // =====================================================
 function buildTranslationPrompt(sourceLang, targetLang) {
   return `
-You are a STRICT translation engine.
+You are a professional multilingual translator.
 
-Task:
-Translate ALL human-readable parts from ${sourceLang} into ${targetLang}.
+Goal:
+Translate the user's message from ${sourceLang} into ${targetLang} accurately and naturally.
 
-MANDATORY RULES:
-1. You MUST translate the text. Never keep the original language unchanged when translation is needed.
-2. Even if the text already partially looks like the target language, you STILL must translate it properly.
-3. Mixed-language sentences MUST be translated into a consistent target language.
-4. Do NOT decide "no translation needed".
-5. Preserve placeholders exactly:
+Rules:
+1. Preserve the original meaning, tone, intention, and context.
+2. Translate naturally, not word-by-word.
+3. Mixed-language sentences must become fluent ${targetLang}.
+4. Do not explain anything.
+5. Do not add labels, quotation marks, notes, or comments.
+6. Keep line breaks as much as possible.
+7. Preserve these placeholders exactly:
    [[[MENTION_*]]], [[[EMOJI_*]]], [[[URL_*]]], [[[KEEP_*]]], [[[CODE_*]]], [[[TOKEN_*]]]
-6. Never translate, remove, or alter placeholders.
-7. Keep numbers, codes, IDs, slash-separated patterns, URLs, room numbers, stock/spec strings, and protected tokens unchanged.
-8. Translate only the natural-language parts.
-9. Keep line breaks as much as possible.
-10. Output ONLY the translated result. No explanation, no labels, no quotation marks.
+8. Never translate, remove, or alter placeholders.
+9. Keep numbers, IDs, URLs, codes, room numbers, product specs, and protected tokens unchanged.
+10. Translate all natural human-readable words.
 
-IMPORTANT:
-- Thai -> Traditional Chinese must become natural Traditional Chinese.
-- Chinese -> Thai must become natural Thai.
-- English -> Traditional Chinese when target is Chinese.
-- Chinese -> English must become natural English.
-- Myanmar -> Traditional Chinese must become natural Traditional Chinese.
-- Chinese -> Myanmar must become natural Myanmar.
-- DO NOT return the original text unchanged unless every human-readable part is already exactly in the required target language.
+Language quality requirements:
+- Thai output must sound natural to native Thai speakers.
+- Traditional Chinese output must sound fluent and natural to native Traditional Chinese readers.
+- English output must sound natural and clear.
+- Myanmar output must sound natural to native Myanmar speakers.
+- Avoid stiff, literal, or machine-like wording.
 
-Examples:
-- "1430/40/2300藍白色 [[[KEEP_0]]] mixed" -> keep 1430/40/2300 and [[[KEEP_0]]] unchanged, translate 藍白色 and mixed.
-- Long Thai sentence in zh-th mode -> output must be Chinese, not Thai.
-- Long English sentence in zh-th or zh-my mode -> output must be Chinese.
+Special:
+- If the source contains short product specs, colors, sizes, or mixed codes, preserve the codes but translate the normal words.
+- If the source contains casual chat, translate it like a natural chat message.
+- Output ONLY the translated result.
 `.trim();
 }
 
-async function translateWithOpenAI(protectedText, sourceLang, targetLang) {
-  const systemPrompt = buildTranslationPrompt(sourceLang, targetLang);
+async function translateWithOpenAI(protectedText, sourceLang, targetLang, strictRetry = false) {
+  const systemPrompt = strictRetry
+    ? `${buildTranslationPrompt(sourceLang, targetLang)}
+
+Extra strict retry:
+The previous output may have been untranslated or too literal.
+Translate again into ${targetLang}.
+Do NOT return the original source language unchanged.
+Output only the final translation.`
+    : buildTranslationPrompt(sourceLang, targetLang);
 
   const response = await openai.chat.completions.create({
     model: OPENAI_MODEL,
-    temperature: 0.0,
+    temperature: 0.1,
     messages: [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: protectedText },
@@ -690,7 +720,8 @@ async function translateText(text, mention, mode) {
   let translatedProtected = await translateWithOpenAI(
     protectedPack.text,
     direction.sourceLang,
-    direction.targetLang
+    direction.targetLang,
+    false
   );
 
   if (!translatedProtected) return null;
@@ -703,15 +734,11 @@ async function translateText(text, mention, mode) {
 
   // 若看起來像沒翻，再重試一次
   if (isLikelyUntranslated(normalized, restored, direction.targetLang)) {
-    const retryInput =
-      `Translate this strictly into ${direction.targetLang}. ` +
-      `Do not keep the original source language. ` +
-      `Preserve placeholders exactly.\n\n${protectedPack.text}`;
-
     translatedProtected = await translateWithOpenAI(
-      retryInput,
+      protectedPack.text,
       direction.sourceLang,
-      direction.targetLang
+      direction.targetLang,
+      true
     );
 
     if (translatedProtected) {
@@ -733,6 +760,7 @@ async function translateText(text, mention, mode) {
 // =====================================================
 async function replyText(replyToken, text) {
   if (!replyToken || !text) return null;
+
   return client.replyMessage(replyToken, {
     type: 'text',
     text,
@@ -778,10 +806,10 @@ async function handleCommand(event, text) {
 - 不需要先 /id，管理員可直接 /auth
 - 必須先授權群組/聊天室，才能翻譯
 - 只有 ADMIN_USER_IDS 內的管理員可執行 /auth /unauth /mode
-- zh-th：中文→泰文，泰文→中文，英文→中文
+- zh-th：中文→泰文，泰文→中文，英文→泰文
 - zh-en：中文→英文，英文→中文
 - zh-my：中文→緬文，緬文→中文，英文→中文
-- 長句已加強強制翻譯與重試
+- 已優化翻譯自然度與長句準確度
 - mention / emoji / URL 保留
 - sticker / 圖片 / 影片 / 音訊 / 檔案不翻
 - UI_SET_LANG:my:zh 這類系統字串一律跳過`
@@ -841,6 +869,7 @@ async function handleCommand(event, text) {
     }
 
     const mode = lower.replace('/mode ', '').trim();
+
     if (!isValidMode(mode)) {
       return replyText(event.replyToken, '模式錯誤，只能使用：zh-th / zh-en / zh-my');
     }
@@ -933,6 +962,7 @@ app.get('/health', (req, res) => {
     requireAuthorization: REQUIRE_AUTHORIZATION,
     allowUserChat: AUTH_ALLOW_USER_CHAT,
     defaultMode: DEFAULT_TRANSLATION_MODE,
+    model: OPENAI_MODEL,
     authorizedCount: Object.values(authStore.sources).filter(v => v && v.authorized).length,
   });
 });
@@ -953,5 +983,6 @@ app.listen(PORT, () => {
   console.log(`✅ REQUIRE_AUTHORIZATION = ${REQUIRE_AUTHORIZATION}`);
   console.log(`✅ AUTH_ALLOW_USER_CHAT = ${AUTH_ALLOW_USER_CHAT}`);
   console.log(`✅ DEFAULT_TRANSLATION_MODE = ${DEFAULT_TRANSLATION_MODE}`);
+  console.log(`✅ OPENAI_MODEL = ${OPENAI_MODEL}`);
   console.log(`✅ ADMIN_USER_IDS count = ${ADMIN_USER_IDS.size}`);
 });
