@@ -1,1 +1,2 @@
 /var/data
+OPENAI_MODEL=gpt-4.1
