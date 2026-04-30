@@ -29,8 +29,6 @@ const openai = new OpenAI({
 });
 
 const PORT = Number(process.env.PORT || 3000);
-
-// 建議正式使用 gpt-4.1，翻譯品質明顯比 mini 穩定
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1';
 
 // =====================================================
@@ -56,31 +54,11 @@ const DEFAULT_TRANSLATION_MODE = String(process.env.TRANSLATION_MODE || 'zh-th')
 const COMMAND_PREFIXES = ['/', '!', '！', '／'];
 
 const ALWAYS_KEEP_WORDS = new Set([
-  'UP',
-  'DOWN',
-  'IN',
-  'OUT',
-  'ON',
-  'OFF',
-  'VIP',
-  'KTV',
-  'LINE',
-  'TG',
-  'DM',
-  'PM',
-  'AM',
-  'OK',
-  'PC',
-  'IOS',
-  'ANDROID',
-  'XS',
-  'S',
-  'M',
-  'L',
-  'XL',
-  'XXL',
-  '2XL',
-  '3XL',
+  'UP', 'DOWN', 'IN', 'OUT', 'ON', 'OFF',
+  'VIP', 'KTV', 'LINE', 'TG', 'DM',
+  'PM', 'AM', 'OK', 'PC',
+  'IOS', 'ANDROID',
+  'XS', 'S', 'M', 'L', 'XL', 'XXL', '2XL', '3XL',
 ]);
 
 const GLOBAL_DICTIONARY = [
@@ -90,7 +68,7 @@ const GLOBAL_DICTIONARY = [
   //   toZh: '藍白色',
   //   toTh: 'สีฟ้าขาว',
   //   toEn: 'blue and white',
-  //   toMy: 'အပြာဖြူ'
+  //   toMy: 'အပြာဖြူ',
   // },
 ];
 
@@ -275,6 +253,7 @@ function authorizeSource(sourceId, mode = DEFAULT_TRANSLATION_MODE, note = 'manu
     updatedAt: new Date().toISOString(),
     note,
   };
+
   writeJsonSafe(AUTH_FILE, authStore);
 }
 
@@ -330,8 +309,6 @@ function modeDisplayName(mode) {
 function containsEnoughHumanText(text) {
   if (!text) return false;
   if (hasChinese(text) || hasThai(text) || hasMyanmar(text)) return true;
-
-  // 英文單字 1 個也允許翻譯，避免短英文不翻
   return countEnglishWords(text) >= 1;
 }
 
@@ -341,10 +318,7 @@ function shouldSkipBecausePureCode(text) {
   const stripped = text.replace(/\s+/g, '');
   if (!stripped) return true;
 
-  // 純網址、純代碼、純符號才跳過
   if (/^[0-9\-_/.:#+()&\[\]%]+$/.test(stripped)) return true;
-
-  // 單一很短英文代碼，例如 A1、B2、AB123
   if (/^#?[A-Za-z]{1,4}\d{1,10}$/.test(stripped)) return true;
   if (/^\d{1,10}[A-Za-z]{1,4}$/.test(stripped)) return true;
 
@@ -357,8 +331,11 @@ function shouldTranslateText(text) {
   if (isCommand(t)) return false;
   if (isSystemControlText(t)) return false;
   if (shouldSkipBecausePureCode(t)) return false;
-  if (containsEnoughHumanText(t)) return true;
-  return false;
+  return containsEnoughHumanText(t);
+}
+
+function createPlaceholder(type, idx) {
+  return `[[[${type}_${idx}]]]`;
 }
 
 function isLikelyUntranslated(originalText, translatedText, targetLang) {
@@ -367,7 +344,6 @@ function isLikelyUntranslated(originalText, translatedText, targetLang) {
 
   if (!original || !translated) return false;
 
-  // 短字詞可能本來就是品牌、代碼，不要太容易重試
   if (original === translated && original.length > 8) return true;
 
   if (targetLang === '繁體中文') {
@@ -392,10 +368,6 @@ function isLikelyUntranslated(originalText, translatedText, targetLang) {
   return false;
 }
 
-function createPlaceholder(type, idx) {
-  return `[[[${type}_${idx}]]]`;
-}
-
 // =====================================================
 // Placeholder 保護
 // =====================================================
@@ -416,11 +388,14 @@ function protectMentions(text, mention) {
   for (const m of sorted) {
     const start = m.index;
     const end = m.index + m.length;
+
     if (start < cursor) continue;
 
     result += text.slice(cursor, start);
+
     const original = text.slice(start, end);
     const ph = createPlaceholder('MENTION', idx++);
+
     map[ph] = original;
     result += ph;
     cursor = end;
@@ -465,6 +440,7 @@ function protectAlwaysKeepWords(text) {
 
   for (const word of ALWAYS_KEEP_WORDS) {
     const re = new RegExp(`\\b${escapeRegExp(word)}\\b`, 'gi');
+
     out = out.replace(re, (m) => {
       const ph = createPlaceholder('KEEP', idx++);
       map[ph] = m;
@@ -472,14 +448,12 @@ function protectAlwaysKeepWords(text) {
     });
   }
 
-  // 保護 1430/40/2300 這種規格碼
   out = out.replace(/\b\d+(?:\/\d+){1,}\b/g, (m) => {
     const ph = createPlaceholder('CODE', idx++);
     map[ph] = m;
     return ph;
   });
 
-  // 只保護明顯代碼，不再過度保護普通英文單字
   out = out.replace(/\b(?:#?[A-Za-z]{1,6}\d{1,10}|\d{1,10}[A-Za-z]{1,6}|[A-Za-z]{1,6}-\d{1,10})\b/g, (m) => {
     if (hasChinese(m) || hasThai(m) || hasMyanmar(m)) return m;
 
@@ -535,6 +509,7 @@ function applyGlobalDictionaryBefore(text) {
 
   for (const item of GLOBAL_DICTIONARY) {
     if (!item || !item.from) continue;
+
     const re = new RegExp(escapeRegExp(item.from), 'g');
     out = out.replace(re, item.from);
   }
@@ -549,6 +524,7 @@ function applyGlobalDictionaryAfter(text, targetLang) {
     if (!item || !item.from) continue;
 
     let replacement = '';
+
     if (targetLang === '繁體中文') replacement = item.toZh || '';
     if (targetLang === 'ไทย') replacement = item.toTh || '';
     if (targetLang === 'English') replacement = item.toEn || '';
@@ -583,7 +559,7 @@ function detectTranslationDirection(text, mode) {
     if (zh && !th) return { sourceLang: '繁體中文', targetLang: 'ไทย' };
     if (th && !zh) return { sourceLang: 'ไทย', targetLang: '繁體中文' };
 
-    // 優化：中泰模式下，純英文改翻泰文
+    // 中泰模式：純英文翻泰文
     if (en && !zh && !th && !my) {
       return { sourceLang: 'English', targetLang: 'ไทย' };
     }
@@ -625,8 +601,10 @@ function detectTranslationDirection(text, mode) {
     if (zh && !my) return { sourceLang: '繁體中文', targetLang: 'မြန်မာဘာသာ' };
     if (my && !zh) return { sourceLang: 'မြန်မာဘာသာ', targetLang: '繁體中文' };
 
-    // 中緬模式下，純英文維持翻中文
-    if (en && !zh && !my && !th) return { sourceLang: 'English', targetLang: '繁體中文' };
+    // 中緬模式：純英文翻中文
+    if (en && !zh && !my && !th) {
+      return { sourceLang: 'English', targetLang: '繁體中文' };
+    }
 
     if (zh && my) {
       if (zhCount >= myCount) return { sourceLang: '繁體中文（含部分မြန်မာဘာသာ）', targetLang: 'မြန်မာဘာသာ' };
@@ -651,6 +629,25 @@ function detectTranslationDirection(text, mode) {
 // OpenAI 翻譯
 // =====================================================
 function buildTranslationPrompt(sourceLang, targetLang) {
+  const isMyanmarRelated =
+    sourceLang.includes('မြန်မာ') ||
+    targetLang.includes('မြန်မာ');
+
+  const myanmarRules = isMyanmarRelated
+    ? `
+Myanmar/Burmese special rules:
+- For Chinese -> Myanmar, translate the meaning naturally, not word-by-word.
+- Use natural Burmese word order and common Burmese expressions.
+- Avoid Chinese-style Burmese.
+- For Myanmar -> Traditional Chinese, translate into fluent Traditional Chinese.
+- Do not produce stiff or literal Chinese.
+- If the Burmese sentence is informal chat, translate it as informal natural Chinese.
+- If the Chinese sentence is informal chat, translate it as natural conversational Burmese.
+- Preserve names, numbers, codes, product specs, URLs, and placeholders.
+- Do not mix Burmese with Chinese unless the original contains protected names, codes, or placeholders.
+`
+    : '';
+
   return `
 You are a professional multilingual translator.
 
@@ -677,6 +674,8 @@ Language quality requirements:
 - Myanmar output must sound natural to native Myanmar speakers.
 - Avoid stiff, literal, or machine-like wording.
 
+${myanmarRules}
+
 Special:
 - If the source contains short product specs, colors, sizes, or mixed codes, preserve the codes but translate the normal words.
 - If the source contains casual chat, translate it like a natural chat message.
@@ -685,22 +684,62 @@ Special:
 }
 
 async function translateWithOpenAI(protectedText, sourceLang, targetLang, strictRetry = false) {
+  const basePrompt = buildTranslationPrompt(sourceLang, targetLang);
+
   const systemPrompt = strictRetry
-    ? `${buildTranslationPrompt(sourceLang, targetLang)}
+    ? `${basePrompt}
 
 Extra strict retry:
-The previous output may have been untranslated or too literal.
+The previous output may have been untranslated, unnatural, or too literal.
 Translate again into ${targetLang}.
 Do NOT return the original source language unchanged.
+Do NOT explain.
 Output only the final translation.`
-    : buildTranslationPrompt(sourceLang, targetLang);
+    : basePrompt;
 
   const response = await openai.chat.completions.create({
     model: OPENAI_MODEL,
-    temperature: 0.1,
+    temperature: strictRetry ? 0.05 : 0.1,
     messages: [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: protectedText },
+    ],
+  });
+
+  return response.choices?.[0]?.message?.content?.trim() || '';
+}
+
+async function polishMyanmarTranslation(protectedText, translatedText, sourceLang, targetLang) {
+  const response = await openai.chat.completions.create({
+    model: OPENAI_MODEL,
+    temperature: 0.05,
+    messages: [
+      {
+        role: 'system',
+        content: `
+You are a senior Chinese-Burmese translation editor.
+
+Task:
+Improve the translation quality.
+
+Requirements:
+- Keep the meaning exactly the same.
+- Make the translation natural and accurate.
+- Fix wrong Burmese/Chinese word choice.
+- Fix unnatural word order.
+- Preserve all placeholders exactly:
+  [[[MENTION_*]]], [[[EMOJI_*]]], [[[URL_*]]], [[[KEEP_*]]], [[[CODE_*]]], [[[TOKEN_*]]]
+- Do not add explanations.
+- Output only the improved translation.
+
+Source language: ${sourceLang}
+Target language: ${targetLang}
+`.trim(),
+      },
+      {
+        role: 'user',
+        content: `Original:\n${protectedText}\n\nTranslation to improve:\n${translatedText}`,
+      },
     ],
   });
 
@@ -726,13 +765,28 @@ async function translateText(text, mention, mode) {
 
   if (!translatedProtected) return null;
 
+  const isMyanmarMode = String(mode || '').toLowerCase() === 'zh-my';
+
+  // 中緬模式額外做一次品質修正
+  if (isMyanmarMode) {
+    const polished = await polishMyanmarTranslation(
+      protectedPack.text,
+      translatedProtected,
+      direction.sourceLang,
+      direction.targetLang
+    );
+
+    if (polished) {
+      translatedProtected = polished;
+    }
+  }
+
   let restored = restorePlaceholders(translatedProtected, protectedPack.map);
   restored = applyGlobalDictionaryAfter(restored, direction.targetLang);
   restored = restored.trim();
 
   if (!restored) return null;
 
-  // 若看起來像沒翻，再重試一次
   if (isLikelyUntranslated(normalized, restored, direction.targetLang)) {
     translatedProtected = await translateWithOpenAI(
       protectedPack.text,
@@ -742,6 +796,19 @@ async function translateText(text, mention, mode) {
     );
 
     if (translatedProtected) {
+      if (isMyanmarMode) {
+        const polishedRetry = await polishMyanmarTranslation(
+          protectedPack.text,
+          translatedProtected,
+          direction.sourceLang,
+          direction.targetLang
+        );
+
+        if (polishedRetry) {
+          translatedProtected = polishedRetry;
+        }
+      }
+
       let retryRestored = restorePlaceholders(translatedProtected, protectedPack.map);
       retryRestored = applyGlobalDictionaryAfter(retryRestored, direction.targetLang);
       retryRestored = retryRestored.trim();
@@ -809,7 +876,7 @@ async function handleCommand(event, text) {
 - zh-th：中文→泰文，泰文→中文，英文→泰文
 - zh-en：中文→英文，英文→中文
 - zh-my：中文→緬文，緬文→中文，英文→中文
-- 已優化翻譯自然度與長句準確度
+- 已加強中緬翻譯準確度與自然度
 - mention / emoji / URL 保留
 - sticker / 圖片 / 影片 / 音訊 / 檔案不翻
 - UI_SET_LANG:my:zh 這類系統字串一律跳過`
