@@ -559,10 +559,10 @@ function detectTranslationDirection(text, mode) {
     if (zh && !th) return { sourceLang: '繁體中文', targetLang: 'ไทย' };
     if (th && !zh) return { sourceLang: 'ไทย', targetLang: '繁體中文' };
 
-    // 中泰模式：純英文翻泰文
-    if (en && !zh && !th && !my) {
-      return { sourceLang: 'English', targetLang: 'ไทย' };
-    }
+    // 中泰模式：純英文一律翻中文
+if (en && !zh && !th && !my) {
+  return { sourceLang: 'English', targetLang: '繁體中文' };
+}
 
     if (zh && th) {
       if (zhCount >= thCount) return { sourceLang: '繁體中文（含部分ไทย）', targetLang: 'ไทย' };
