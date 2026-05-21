@@ -61,8 +61,10 @@ const ALWAYS_KEEP_WORDS = new Set([
   'XS', 'S', 'M', 'L', 'XL', 'XXL', '2XL', '3XL',
 ]);
 
+// =====================================================
+// 全域辭典：適合放「固定商品名 / 固定術語」
+// =====================================================
 const GLOBAL_DICTIONARY = [
-  // 可自行增加常用詞
   // {
   //   from: '藍白色',
   //   toZh: '藍白色',
@@ -70,6 +72,42 @@ const GLOBAL_DICTIONARY = [
   //   toEn: 'blue and white',
   //   toMy: 'အပြာဖြူ',
   // },
+];
+
+// =====================================================
+// 聊天語境提示：不直接替換，只給 AI 當語境參考
+// =====================================================
+const CHAT_PHRASE_HINTS = [
+  {
+    lang: 'thai',
+    phrase: 'ไม่ยุ่งแล้วคะ',
+    meaningZh: '不忙了 / 現在有空了',
+  },
+  {
+    lang: 'thai',
+    phrase: 'ไม่ยุ่งแล้วค่ะ',
+    meaningZh: '不忙了 / 現在有空了',
+  },
+  {
+    lang: 'thai',
+    phrase: 'ว่างแล้ว',
+    meaningZh: '有空了 / 現在有空',
+  },
+  {
+    lang: 'thai',
+    phrase: 'ไม่ว่าง',
+    meaningZh: '沒空 / 不方便',
+  },
+  {
+    lang: 'thai',
+    phrase: 'ได้ค่ะ',
+    meaningZh: '可以 / 好的',
+  },
+  {
+    lang: 'thai',
+    phrase: 'ไม่ได้มีพิรุธ',
+    meaningZh: '沒有可疑 / 沒什麼怪怪的',
+  },
 ];
 
 // =====================================================
@@ -253,7 +291,6 @@ function authorizeSource(sourceId, mode = DEFAULT_TRANSLATION_MODE, note = 'manu
     updatedAt: new Date().toISOString(),
     note,
   };
-
   writeJsonSafe(AUTH_FILE, authStore);
 }
 
@@ -270,7 +307,6 @@ function unauthorizeSource(sourceId) {
     authStore.sources[sourceId].updatedAt = new Date().toISOString();
     authStore.sources[sourceId].note = 'manual unauth';
   }
-
   writeJsonSafe(AUTH_FILE, authStore);
 }
 
@@ -540,6 +576,25 @@ function applyGlobalDictionaryAfter(text, targetLang) {
 }
 
 // =====================================================
+// 聊天語境提示
+// =====================================================
+function buildChatPhraseHints(text, sourceLang, targetLang) {
+  const hints = [];
+
+  for (const item of CHAT_PHRASE_HINTS) {
+    if (!item || !item.phrase) continue;
+
+    if (text.includes(item.phrase)) {
+      if (targetLang === '繁體中文' && item.meaningZh) {
+        hints.push(`- "${item.phrase}" in casual Thai chat usually means "${item.meaningZh}".`);
+      }
+    }
+  }
+
+  return hints.length ? hints.join('\n') : '';
+}
+
+// =====================================================
 // 多語模式判斷
 // =====================================================
 function detectTranslationDirection(text, mode) {
@@ -559,10 +614,10 @@ function detectTranslationDirection(text, mode) {
     if (zh && !th) return { sourceLang: '繁體中文', targetLang: 'ไทย' };
     if (th && !zh) return { sourceLang: 'ไทย', targetLang: '繁體中文' };
 
-    // 中泰模式：純英文一律翻中文
-if (en && !zh && !th && !my) {
-  return { sourceLang: 'English', targetLang: '繁體中文' };
-}
+    // 你的需求：有人說英文時，一律翻譯成中文
+    if (en && !zh && !th && !my) {
+      return { sourceLang: 'English', targetLang: '繁體中文' };
+    }
 
     if (zh && th) {
       if (zhCount >= thCount) return { sourceLang: '繁體中文（含部分ไทย）', targetLang: 'ไทย' };
@@ -601,7 +656,7 @@ if (en && !zh && !th && !my) {
     if (zh && !my) return { sourceLang: '繁體中文', targetLang: 'မြန်မာဘာသာ' };
     if (my && !zh) return { sourceLang: 'မြန်မာဘာသာ', targetLang: '繁體中文' };
 
-    // 中緬模式：純英文翻中文
+    // 你的需求：有人說英文時，一律翻譯成中文
     if (en && !zh && !my && !th) {
       return { sourceLang: 'English', targetLang: '繁體中文' };
     }
@@ -628,10 +683,19 @@ if (en && !zh && !th && !my) {
 // =====================================================
 // OpenAI 翻譯
 // =====================================================
-function buildTranslationPrompt(sourceLang, targetLang) {
+function buildTranslationPrompt(sourceLang, targetLang, originalText = '') {
   const isMyanmarRelated =
     sourceLang.includes('မြန်မာ') ||
     targetLang.includes('မြန်မာ');
+
+  const chatHints = buildChatPhraseHints(originalText, sourceLang, targetLang);
+
+  const hintBlock = chatHints
+    ? `
+Important phrase hints:
+${chatHints}
+`
+    : '';
 
   const myanmarRules = isMyanmarRelated
     ? `
@@ -649,12 +713,12 @@ Myanmar/Burmese special rules:
     : '';
 
   return `
-You are a professional multilingual translator.
+You are a professional multilingual translator for LINE chat messages.
 
 Goal:
 Translate the user's message from ${sourceLang} into ${targetLang} accurately and naturally.
 
-Rules:
+Core rules:
 1. Preserve the original meaning, tone, intention, and context.
 2. Translate naturally, not word-by-word.
 3. Mixed-language sentences must become fluent ${targetLang}.
@@ -667,6 +731,23 @@ Rules:
 9. Keep numbers, IDs, URLs, codes, room numbers, product specs, and protected tokens unchanged.
 10. Translate all natural human-readable words.
 
+Conversation context rules:
+- Most messages are casual LINE chat messages.
+- Prefer natural conversational meaning over literal dictionary meaning.
+- Translate according to real chat usage and social context.
+- Thai words with multiple meanings should use the most common conversational chat meaning.
+- Burmese words with multiple meanings should use the most common conversational chat meaning.
+- Avoid overly formal, literary, or stiff translations.
+- If a Thai sentence sounds like casual daily conversation, translate it naturally into spoken Traditional Chinese.
+- If a Chinese sentence sounds like casual daily conversation, translate it naturally into Thai or Burmese.
+- Short chat replies should stay short and natural.
+- Polite particles such as คะ, ค่ะ, ครับ usually indicate tone, not extra meaning.
+
+Thai-specific caution:
+- Thai "ยุ่ง" in casual chat often means "busy", not necessarily "disturb/interfere".
+- For example, "ไม่ยุ่งแล้วคะ/ค่ะ" usually means "不忙了 / 現在有空了", not "不再打擾了".
+- Thai "ว่าง" means free/available in chat context.
+
 Language quality requirements:
 - Thai output must sound natural to native Thai speakers.
 - Traditional Chinese output must sound fluent and natural to native Traditional Chinese readers.
@@ -674,6 +755,7 @@ Language quality requirements:
 - Myanmar output must sound natural to native Myanmar speakers.
 - Avoid stiff, literal, or machine-like wording.
 
+${hintBlock}
 ${myanmarRules}
 
 Special:
@@ -684,14 +766,15 @@ Special:
 }
 
 async function translateWithOpenAI(protectedText, sourceLang, targetLang, strictRetry = false) {
-  const basePrompt = buildTranslationPrompt(sourceLang, targetLang);
+  const basePrompt = buildTranslationPrompt(sourceLang, targetLang, protectedText);
 
   const systemPrompt = strictRetry
     ? `${basePrompt}
 
 Extra strict retry:
-The previous output may have been untranslated, unnatural, or too literal.
+The previous output may have been untranslated, unnatural, too literal, or used the wrong chat meaning.
 Translate again into ${targetLang}.
+Choose the meaning that fits casual LINE chat.
 Do NOT return the original source language unchanged.
 Do NOT explain.
 Output only the final translation.`
@@ -703,6 +786,49 @@ Output only the final translation.`
     messages: [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: protectedText },
+    ],
+  });
+
+  return response.choices?.[0]?.message?.content?.trim() || '';
+}
+
+async function refineChatTranslation(protectedOriginal, translatedText, sourceLang, targetLang) {
+  const response = await openai.chat.completions.create({
+    model: OPENAI_MODEL,
+    temperature: 0.05,
+    messages: [
+      {
+        role: 'system',
+        content: `
+You are a senior LINE chat translation editor.
+
+Task:
+Review and improve the translation based on casual chat context.
+
+Requirements:
+- Keep the same meaning as the original.
+- Fix mistranslations caused by literal dictionary meanings.
+- Prefer the natural conversational meaning.
+- Keep short replies short.
+- Do not over-explain.
+- Do not add information.
+- Preserve all placeholders exactly:
+  [[[MENTION_*]]], [[[EMOJI_*]]], [[[URL_*]]], [[[KEEP_*]]], [[[CODE_*]]], [[[TOKEN_*]]]
+- Output only the improved translation.
+
+Important examples:
+- Thai "ไม่ยุ่งแล้วคะ/ค่ะ" in casual chat usually means "不忙了 / 現在有空了", not "不再打擾了".
+- Thai "ว่างแล้ว" means "有空了".
+- Thai polite particles like คะ/ค่ะ/ครับ should not be translated literally.
+
+Source language: ${sourceLang}
+Target language: ${targetLang}
+`.trim(),
+      },
+      {
+        role: 'user',
+        content: `Original:\n${protectedOriginal}\n\nCurrent translation:\n${translatedText}`,
+      },
     ],
   });
 
@@ -766,8 +892,25 @@ async function translateText(text, mention, mode) {
   if (!translatedProtected) return null;
 
   const isMyanmarMode = String(mode || '').toLowerCase() === 'zh-my';
+  const isThaiToChinese =
+    direction.sourceLang.includes('ไทย') &&
+    direction.targetLang === '繁體中文';
 
-  // 中緬模式額外做一次品質修正
+  // 泰文→中文：額外做聊天語境校正，改善「忙/打擾」這類多義詞
+  if (isThaiToChinese) {
+    const refined = await refineChatTranslation(
+      protectedPack.text,
+      translatedProtected,
+      direction.sourceLang,
+      direction.targetLang
+    );
+
+    if (refined) {
+      translatedProtected = refined;
+    }
+  }
+
+  // 中緬模式：額外做一次品質修正
   if (isMyanmarMode) {
     const polished = await polishMyanmarTranslation(
       protectedPack.text,
@@ -796,6 +939,19 @@ async function translateText(text, mention, mode) {
     );
 
     if (translatedProtected) {
+      if (isThaiToChinese) {
+        const refinedRetry = await refineChatTranslation(
+          protectedPack.text,
+          translatedProtected,
+          direction.sourceLang,
+          direction.targetLang
+        );
+
+        if (refinedRetry) {
+          translatedProtected = refinedRetry;
+        }
+      }
+
       if (isMyanmarMode) {
         const polishedRetry = await polishMyanmarTranslation(
           protectedPack.text,
@@ -873,9 +1029,11 @@ async function handleCommand(event, text) {
 - 不需要先 /id，管理員可直接 /auth
 - 必須先授權群組/聊天室，才能翻譯
 - 只有 ADMIN_USER_IDS 內的管理員可執行 /auth /unauth /mode
-- zh-th：中文→泰文，泰文→中文，英文→泰文
+- zh-th：中文→泰文，泰文→中文，英文→中文
 - zh-en：中文→英文，英文→中文
 - zh-my：中文→緬文，緬文→中文，英文→中文
+- 已加強 LINE 聊天語境判斷
+- 已加強泰文多義詞判斷，例如 ยุ่ง 優先依聊天語境翻成「忙」
 - 已加強中緬翻譯準確度與自然度
 - mention / emoji / URL 保留
 - sticker / 圖片 / 影片 / 音訊 / 檔案不翻
