@@ -21,7 +21,11 @@ if (!config.channelAccessToken || !config.channelSecret || !process.env.OPENAI_A
 }
 
 const client = new line.Client(config);
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+  timeout: 30000,
+  maxRetries: 2,
+});
 
 const PORT = Number(process.env.PORT || 3000);
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
@@ -55,15 +59,19 @@ const ALWAYS_KEEP_WORDS = new Set([
 const GLOBAL_DICTIONARY = [];
 
 const CHAT_PHRASE_HINTS = [
-  { lang: 'thai', phrase: 'ไม่ยุ่งแล้วคะ', meaningZh: '不忙了 / 現在有空了' },
-  { lang: 'thai', phrase: 'ไม่ยุ่งแล้วค่ะ', meaningZh: '不忙了 / 現在有空了' },
-  { lang: 'thai', phrase: 'ว่างแล้ว', meaningZh: '有空了 / 現在有空' },
-  { lang: 'thai', phrase: 'ไม่ว่าง', meaningZh: '沒空 / 不方便' },
-  { lang: 'thai', phrase: 'ได้ค่ะ', meaningZh: '可以 / 好的' },
+  { phrase: 'ไม่ยุ่งแล้วคะ', meaningZh: '不忙了 / 現在有空了' },
+  { phrase: 'ไม่ยุ่งแล้วค่ะ', meaningZh: '不忙了 / 現在有空了' },
+  { phrase: 'ว่างแล้ว', meaningZh: '有空了 / 現在有空' },
+  { phrase: 'ไม่ว่าง', meaningZh: '沒空 / 不方便' },
+  { phrase: 'ได้ค่ะ', meaningZh: '可以 / 好的' },
 ];
 
 const DATA_DIR = path.join(__dirname, 'data');
 const AUTH_FILE = path.join(DATA_DIR, 'authorized-sources.json');
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -91,10 +99,7 @@ function writeJsonSafe(filePath, data) {
 
 function loadAuthStore() {
   const initial = readJsonSafe(AUTH_FILE, { sources: {} });
-
-  if (!initial.sources || typeof initial.sources !== 'object') {
-    initial.sources = {};
-  }
+  if (!initial.sources || typeof initial.sources !== 'object') initial.sources = {};
 
   for (const sourceId of SEED_ALLOWED_SOURCE_IDS) {
     if (!initial.sources[sourceId]) {
@@ -162,7 +167,9 @@ function isCommand(text) {
 
 function isSystemControlText(text) {
   const t = normalizeText(text);
-  return /^UI_[A-Z0-9_:.-]+$/u.test(t) || /^SYS_[A-Z0-9_:.-]+$/u.test(t) || /^CMD_[A-Z0-9_:.-]+$/u.test(t);
+  return /^UI_[A-Z0-9_:.-]+$/u.test(t) ||
+    /^SYS_[A-Z0-9_:.-]+$/u.test(t) ||
+    /^CMD_[A-Z0-9_:.-]+$/u.test(t);
 }
 
 function getSourceId(event) {
@@ -252,11 +259,14 @@ function modeDisplayName(mode) {
 
 function shouldSkipBecausePureCode(text) {
   if (hasChinese(text) || hasThai(text) || hasMyanmar(text)) return false;
+
   const stripped = text.replace(/\s+/g, '');
   if (!stripped) return true;
+  if (/^[?!？！，。….,~～]+$/.test(stripped)) return true;
   if (/^[0-9\-_/.:#+()&\[\]%]+$/.test(stripped)) return true;
   if (/^#?[A-Za-z]{1,4}\d{1,10}$/.test(stripped)) return true;
   if (/^\d{1,10}[A-Za-z]{1,4}$/.test(stripped)) return true;
+
   return false;
 }
 
@@ -306,22 +316,26 @@ function protectMentions(text, mention) {
 function protectEmojis(text) {
   const map = {};
   let idx = 0;
+
   const out = text.replace(/(\p{Extended_Pictographic}(?:\uFE0F)?)/gu, (m) => {
     const ph = createPlaceholder('EMOJI', idx++);
     map[ph] = m;
     return ph;
   });
+
   return { text: out, map };
 }
 
 function protectUrls(text) {
   const map = {};
   let idx = 0;
+
   const out = text.replace(/https?:\/\/[^\s]+/gi, (m) => {
     const ph = createPlaceholder('URL', idx++);
     map[ph] = m;
     return ph;
   });
+
   return { text: out, map };
 }
 
@@ -371,12 +385,14 @@ function restorePlaceholders(text, map) {
 
   for (let i = 0; i < 10; i++) {
     let changed = false;
+
     for (const [ph, original] of Object.entries(map)) {
       if (out.includes(ph)) {
         out = out.split(ph).join(original);
         changed = true;
       }
     }
+
     if (!changed) break;
   }
 
@@ -562,6 +578,64 @@ Output ONLY the translated result.
 `.trim();
 }
 
+function shouldRetryOpenAIError(err) {
+  const code = err?.code || err?.cause?.code || err?.error?.code;
+  const message = err?.message || '';
+  const status = err?.status;
+
+  return (
+    code === 'ERR_STREAM_PREMATURE_CLOSE' ||
+    code === 'ECONNRESET' ||
+    code === 'ETIMEDOUT' ||
+    code === 'ENOTFOUND' ||
+    message.includes('ERR_STREAM_PREMATURE_CLOSE') ||
+    message.includes('Invalid response body') ||
+    message.includes('Premature close') ||
+    status === 408 ||
+    status === 409 ||
+    status === 429 ||
+    status === 500 ||
+    status === 502 ||
+    status === 503 ||
+    status === 504
+  );
+}
+
+async function callOpenAIChatWithRetry(messages, temperature, label = 'openai') {
+  const maxRetries = 3;
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await openai.chat.completions.create({
+        model: OPENAI_MODEL,
+        temperature,
+        messages,
+      });
+
+      return response.choices?.[0]?.message?.content?.trim() || '';
+    } catch (err) {
+      lastErr = err;
+
+      const canRetry = shouldRetryOpenAIError(err);
+      console.error(`${label} attempt ${attempt} failed:`, {
+        message: err?.message,
+        status: err?.status,
+        code: err?.code || err?.cause?.code || err?.error?.code,
+        retry: canRetry,
+      });
+
+      if (!canRetry || attempt === maxRetries) {
+        throw err;
+      }
+
+      await sleep(800 * attempt);
+    }
+  }
+
+  throw lastErr;
+}
+
 async function translateWithOpenAI(protectedText, sourceLang, targetLang, strictRetry = false) {
   const basePrompt = buildTranslationPrompt(sourceLang, targetLang, protectedText);
 
@@ -577,23 +651,19 @@ Translate again naturally.
 Output only the corrected translation.`
     : basePrompt;
 
-  const response = await openai.chat.completions.create({
-    model: OPENAI_MODEL,
-    temperature: strictRetry ? 0.03 : 0.08,
-    messages: [
+  return callOpenAIChatWithRetry(
+    [
       { role: 'system', content: systemPrompt },
       { role: 'user', content: protectedText },
     ],
-  });
-
-  return response.choices?.[0]?.message?.content?.trim() || '';
+    strictRetry ? 0.03 : 0.08,
+    'translateWithOpenAI'
+  );
 }
 
 async function refineChatTranslation(protectedOriginal, translatedText, sourceLang, targetLang) {
-  const response = await openai.chat.completions.create({
-    model: OPENAI_MODEL,
-    temperature: 0.03,
-    messages: [
+  return callOpenAIChatWithRetry(
+    [
       {
         role: 'system',
         content: `
@@ -627,16 +697,14 @@ Target language: ${targetLang}
         content: `Original:\n${protectedOriginal}\n\nCurrent translation:\n${translatedText}`,
       },
     ],
-  });
-
-  return response.choices?.[0]?.message?.content?.trim() || '';
+    0.03,
+    'refineChatTranslation'
+  );
 }
 
 async function polishMyanmarTranslation(protectedText, translatedText, sourceLang, targetLang) {
-  const response = await openai.chat.completions.create({
-    model: OPENAI_MODEL,
-    temperature: 0.03,
-    messages: [
+  return callOpenAIChatWithRetry(
+    [
       {
         role: 'system',
         content: `
@@ -657,9 +725,9 @@ Target language: ${targetLang}
         content: `Original:\n${protectedText}\n\nTranslation to improve:\n${translatedText}`,
       },
     ],
-  });
-
-  return response.choices?.[0]?.message?.content?.trim() || '';
+    0.03,
+    'polishMyanmarTranslation'
+  );
 }
 
 async function translateText(text, mention, mode) {
@@ -688,23 +756,31 @@ async function translateText(text, mention, mode) {
   const isMyanmarMode = String(mode || '').toLowerCase() === 'zh-my';
 
   if (isThaiToChinese) {
-    const refined = await refineChatTranslation(
-      protectedPack.text,
-      translatedProtected,
-      direction.sourceLang,
-      direction.targetLang
-    );
-    if (refined) translatedProtected = refined;
+    try {
+      const refined = await refineChatTranslation(
+        protectedPack.text,
+        translatedProtected,
+        direction.sourceLang,
+        direction.targetLang
+      );
+      if (refined) translatedProtected = refined;
+    } catch (err) {
+      console.error('refineChatTranslation skipped:', err?.message);
+    }
   }
 
   if (isMyanmarMode) {
-    const polished = await polishMyanmarTranslation(
-      protectedPack.text,
-      translatedProtected,
-      direction.sourceLang,
-      direction.targetLang
-    );
-    if (polished) translatedProtected = polished;
+    try {
+      const polished = await polishMyanmarTranslation(
+        protectedPack.text,
+        translatedProtected,
+        direction.sourceLang,
+        direction.targetLang
+      );
+      if (polished) translatedProtected = polished;
+    } catch (err) {
+      console.error('polishMyanmarTranslation skipped:', err?.message);
+    }
   }
 
   let restored = restorePlaceholders(translatedProtected, protectedPack.map);
@@ -721,26 +797,6 @@ async function translateText(text, mention, mode) {
     );
 
     if (translatedProtected) {
-      if (isThaiToChinese) {
-        const refinedRetry = await refineChatTranslation(
-          protectedPack.text,
-          translatedProtected,
-          direction.sourceLang,
-          direction.targetLang
-        );
-        if (refinedRetry) translatedProtected = refinedRetry;
-      }
-
-      if (isMyanmarMode) {
-        const polishedRetry = await polishMyanmarTranslation(
-          protectedPack.text,
-          translatedProtected,
-          direction.sourceLang,
-          direction.targetLang
-        );
-        if (polishedRetry) translatedProtected = polishedRetry;
-      }
-
       const retryRestored = applyGlobalDictionaryAfter(
         restorePlaceholders(translatedProtected, protectedPack.map),
         direction.targetLang
@@ -800,7 +856,8 @@ async function handleCommand(event, text) {
 - 已加強泰文你我他判斷
 - เขา 優先翻成 他/她/對方，不會亂翻成你
 - 已加強 LINE 聊天語境
-- 已加強中緬翻譯自然度`
+- 已加強中緬翻譯自然度
+- 已加入 OpenAI 斷線自動重試`
     );
   }
 
@@ -905,7 +962,7 @@ async function handleEvent(event) {
   } catch (err) {
     console.error('handleEvent error message:', err?.message);
     console.error('handleEvent error status:', err?.status);
-    console.error('handleEvent error code:', err?.code);
+    console.error('handleEvent error code:', err?.code || err?.cause?.code || err?.error?.code);
     console.error('handleEvent error full:', err);
 
     try {
