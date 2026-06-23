@@ -1,2 +1,2 @@
 /var/data
-OPENAI_MODEL=gpt-4.1
+OPENAI_MODEL=gpt-5
