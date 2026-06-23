@@ -16,14 +16,15 @@ const config = {
 };
 
 if (!config.channelAccessToken || !config.channelSecret || !process.env.OPENAI_API_KEY) {
-  console.error('❌ 缺少必要環境變數');
+  console.error('❌ 缺少必要環境變數：LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET / OPENAI_API_KEY');
   process.exit(1);
 }
 
 const client = new line.Client(config);
+
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
-  timeout: 30000,
+  timeout: Number(process.env.OPENAI_TIMEOUT_MS || 30000),
   maxRetries: 2,
 });
 
@@ -56,14 +57,50 @@ const ALWAYS_KEEP_WORDS = new Set([
   'XS', 'S', 'M', 'L', 'XL', 'XXL', '2XL', '3XL',
 ]);
 
-const GLOBAL_DICTIONARY = [];
+const GLOBAL_DICTIONARY = [
+  // 固定詞可以放這裡
+  // {
+  //   from: '藍白色',
+  //   toZh: '藍白色',
+  //   toTh: 'สีฟ้าขาว',
+  //   toEn: 'blue and white',
+  //   toMy: 'အပြာဖြူ',
+  // },
+];
 
 const CHAT_PHRASE_HINTS = [
-  { phrase: 'ไม่ยุ่งแล้วคะ', meaningZh: '不忙了 / 現在有空了' },
-  { phrase: 'ไม่ยุ่งแล้วค่ะ', meaningZh: '不忙了 / 現在有空了' },
-  { phrase: 'ว่างแล้ว', meaningZh: '有空了 / 現在有空' },
-  { phrase: 'ไม่ว่าง', meaningZh: '沒空 / 不方便' },
-  { phrase: 'ได้ค่ะ', meaningZh: '可以 / 好的' },
+  {
+    phrase: 'ไม่ยุ่งแล้วคะ',
+    meaningZh: '不忙了 / 現在有空了',
+  },
+  {
+    phrase: 'ไม่ยุ่งแล้วค่ะ',
+    meaningZh: '不忙了 / 現在有空了',
+  },
+  {
+    phrase: 'ว่างแล้ว',
+    meaningZh: '有空了 / 現在有空',
+  },
+  {
+    phrase: 'ไม่ว่าง',
+    meaningZh: '沒空 / 不方便',
+  },
+  {
+    phrase: 'ได้ค่ะ',
+    meaningZh: '可以 / 好的',
+  },
+  {
+    phrase: 'ไม่ได้มีพิรุธ',
+    meaningZh: '沒有可疑 / 沒什麼怪怪的',
+  },
+  {
+    phrase: 'ไม่ให้ห่วงคุณจะให้ห่วงหมาที่ไหนละ',
+    meaningZh: '不擔心你，難道要去擔心狗嗎？',
+  },
+  {
+    phrase: 'จะให้ห่วงหมาที่ไหนละ',
+    meaningZh: '難道要去擔心狗嗎？',
+  },
 ];
 
 const DATA_DIR = path.join(__dirname, 'data');
@@ -74,14 +111,17 @@ function sleep(ms) {
 }
 
 function ensureDataDir() {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
 }
 
 function readJsonSafe(filePath, fallback) {
   try {
     if (!fs.existsSync(filePath)) return fallback;
     return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-  } catch {
+  } catch (err) {
+    console.error(`readJsonSafe error (${filePath}):`, err);
     return fallback;
   }
 }
@@ -92,14 +132,21 @@ function writeJsonSafe(filePath, data) {
     fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
     return true;
   } catch (err) {
-    console.error('writeJsonSafe error:', err);
+    console.error(`writeJsonSafe error (${filePath}):`, err);
     return false;
   }
 }
 
 function loadAuthStore() {
   const initial = readJsonSafe(AUTH_FILE, { sources: {} });
-  if (!initial.sources || typeof initial.sources !== 'object') initial.sources = {};
+
+  if (!initial || typeof initial !== 'object') {
+    return { sources: {} };
+  }
+
+  if (!initial.sources || typeof initial.sources !== 'object') {
+    initial.sources = {};
+  }
 
   for (const sourceId of SEED_ALLOWED_SOURCE_IDS) {
     if (!initial.sources[sourceId]) {
@@ -119,11 +166,14 @@ function loadAuthStore() {
 let authStore = loadAuthStore();
 
 function escapeRegExp(str) {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function normalizeText(text) {
-  return (text || '').replace(/\r\n/g, '\n').replace(/\u00A0/g, ' ').trim();
+  return (text || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\u00A0/g, ' ')
+    .trim();
 }
 
 function hasChinese(text) {
@@ -167,9 +217,12 @@ function isCommand(text) {
 
 function isSystemControlText(text) {
   const t = normalizeText(text);
-  return /^UI_[A-Z0-9_:.-]+$/u.test(t) ||
+  if (!t) return false;
+  return (
+    /^UI_[A-Z0-9_:.-]+$/u.test(t) ||
     /^SYS_[A-Z0-9_:.-]+$/u.test(t) ||
-    /^CMD_[A-Z0-9_:.-]+$/u.test(t);
+    /^CMD_[A-Z0-9_:.-]+$/u.test(t)
+  );
 }
 
 function getSourceId(event) {
@@ -203,7 +256,10 @@ function isSourceAuthorized(event) {
   const sourceId = getSourceId(event);
 
   if (!sourceId) return false;
-  if (sourceType === 'user') return AUTH_ALLOW_USER_CHAT;
+
+  if (sourceType === 'user') {
+    return AUTH_ALLOW_USER_CHAT;
+  }
 
   const rec = getAuthorizedRecord(sourceId);
   return !!(rec && rec.authorized === true);
@@ -216,6 +272,7 @@ function authorizeSource(sourceId, mode = DEFAULT_TRANSLATION_MODE, note = 'manu
     updatedAt: new Date().toISOString(),
     note,
   };
+
   writeJsonSafe(AUTH_FILE, authStore);
 }
 
@@ -227,6 +284,7 @@ function unauthorizeSource(sourceId) {
     updatedAt: new Date().toISOString(),
     note: 'manual unauth',
   };
+
   writeJsonSafe(AUTH_FILE, authStore);
 }
 
@@ -242,6 +300,7 @@ function setSourceMode(sourceId, mode) {
     updatedAt: new Date().toISOString(),
     note: 'mode updated',
   };
+
   writeJsonSafe(AUTH_FILE, authStore);
 }
 
@@ -262,6 +321,7 @@ function shouldSkipBecausePureCode(text) {
 
   const stripped = text.replace(/\s+/g, '');
   if (!stripped) return true;
+
   if (/^[?!？！，。….,~～]+$/.test(stripped)) return true;
   if (/^[0-9\-_/.:#+()&\[\]%]+$/.test(stripped)) return true;
   if (/^#?[A-Za-z]{1,4}\d{1,10}$/.test(stripped)) return true;
@@ -276,6 +336,7 @@ function shouldTranslateText(text) {
   if (isCommand(t)) return false;
   if (isSystemControlText(t)) return false;
   if (shouldSkipBecausePureCode(t)) return false;
+
   if (hasChinese(t) || hasThai(t) || hasMyanmar(t)) return true;
   return countEnglishWords(t) >= 1;
 }
@@ -285,7 +346,9 @@ function createPlaceholder(type, idx) {
 }
 
 function protectMentions(text, mention) {
-  if (!mention || !Array.isArray(mention.mentionees)) return { text, map: {} };
+  if (!mention || !Array.isArray(mention.mentionees)) {
+    return { text, map: {} };
+  }
 
   const sorted = [...mention.mentionees]
     .filter(m => Number.isInteger(m.index) && Number.isInteger(m.length))
@@ -302,8 +365,10 @@ function protectMentions(text, mention) {
     if (start < cursor) continue;
 
     result += text.slice(cursor, start);
+
     const original = text.slice(start, end);
     const ph = createPlaceholder('MENTION', idx++);
+
     map[ph] = original;
     result += ph;
     cursor = end;
@@ -346,6 +411,7 @@ function protectAlwaysKeepWords(text) {
 
   for (const word of ALWAYS_KEEP_WORDS) {
     const re = new RegExp(`\\b${escapeRegExp(word)}\\b`, 'gi');
+
     out = out.replace(re, (m) => {
       const ph = createPlaceholder('KEEP', idx++);
       map[ph] = m;
@@ -376,7 +442,12 @@ function protectText(text, mention) {
 
   return {
     text: p4.text,
-    map: { ...p1.map, ...p2.map, ...p3.map, ...p4.map },
+    map: {
+      ...p1.map,
+      ...p2.map,
+      ...p3.map,
+      ...p4.map,
+    },
   };
 }
 
@@ -410,6 +481,7 @@ function applyGlobalDictionaryAfter(text, targetLang) {
     if (!item || !item.from) continue;
 
     let replacement = '';
+
     if (targetLang === '繁體中文') replacement = item.toZh || '';
     if (targetLang === 'ไทย') replacement = item.toTh || '';
     if (targetLang === 'English') replacement = item.toEn || '';
@@ -423,10 +495,12 @@ function applyGlobalDictionaryAfter(text, targetLang) {
   return out;
 }
 
-function buildChatPhraseHints(text, sourceLang, targetLang) {
+function buildChatPhraseHints(text, targetLang) {
   const hints = [];
 
   for (const item of CHAT_PHRASE_HINTS) {
+    if (!item || !item.phrase) continue;
+
     if (text.includes(item.phrase) && targetLang === '繁體中文' && item.meaningZh) {
       hints.push(`- "${item.phrase}" in casual Thai chat usually means "${item.meaningZh}".`);
     }
@@ -451,15 +525,29 @@ function detectTranslationDirection(text, mode) {
   if (m === 'zh-th') {
     if (zh && !th) return { sourceLang: '繁體中文', targetLang: 'ไทย' };
     if (th && !zh) return { sourceLang: 'ไทย', targetLang: '繁體中文' };
-    if (en && !zh && !th && !my) return { sourceLang: 'English', targetLang: '繁體中文' };
+
+    if (en && !zh && !th && !my) {
+      return { sourceLang: 'English', targetLang: '繁體中文' };
+    }
 
     if (zh && th) {
-      if (zhCount >= thCount) return { sourceLang: '繁體中文（含部分ไทย）', targetLang: 'ไทย' };
+      if (zhCount >= thCount) {
+        return { sourceLang: '繁體中文（含部分ไทย）', targetLang: 'ไทย' };
+      }
+
       return { sourceLang: 'ไทย（含部分中文）', targetLang: '繁體中文' };
     }
 
     if (zh && en && !th) return { sourceLang: '繁體中文（含部分English）', targetLang: 'ไทย' };
     if (th && en && !zh) return { sourceLang: 'ไทย（含部分English）', targetLang: '繁體中文' };
+
+    if (zh && th && en) {
+      if (zhCount >= thCount) {
+        return { sourceLang: '繁體中文（含部分ไทย/English）', targetLang: 'ไทย' };
+      }
+
+      return { sourceLang: 'ไทย（含部分中文/English）', targetLang: '繁體中文' };
+    }
 
     return null;
   }
@@ -469,7 +557,10 @@ function detectTranslationDirection(text, mode) {
     if (en && !zh && !th && !my) return { sourceLang: 'English', targetLang: '繁體中文' };
 
     if (zh && en && !th && !my) {
-      if (zhCount >= enCount) return { sourceLang: '繁體中文（含部分English）', targetLang: 'English' };
+      if (zhCount >= enCount) {
+        return { sourceLang: '繁體中文（含部分English）', targetLang: 'English' };
+      }
+
       return { sourceLang: 'English（含部分中文）', targetLang: '繁體中文' };
     }
 
@@ -482,15 +573,26 @@ function detectTranslationDirection(text, mode) {
   if (m === 'zh-my') {
     if (zh && !my) return { sourceLang: '繁體中文', targetLang: 'မြန်မာဘာသာ' };
     if (my && !zh) return { sourceLang: 'မြန်မာဘာသာ', targetLang: '繁體中文' };
-    if (en && !zh && !my && !th) return { sourceLang: 'English', targetLang: '繁體中文' };
+
+    if (en && !zh && !my && !th) {
+      return { sourceLang: 'English', targetLang: '繁體中文' };
+    }
 
     if (zh && my) {
-      if (zhCount >= myCount) return { sourceLang: '繁體中文（含部分မြန်မာဘာသာ）', targetLang: 'မြန်မာဘာသာ' };
+      if (zhCount >= myCount) {
+        return { sourceLang: '繁體中文（含部分မြန်မာဘာသာ）', targetLang: 'မြန်မာဘာသာ' };
+      }
+
       return { sourceLang: 'မြန်မာဘာသာ（含部分中文）', targetLang: '繁體中文' };
     }
 
-    if (zh && en && !my) return { sourceLang: '繁體中文（含部分English）', targetLang: 'မြန်မာဘာသာ' };
-    if (my && en && !zh) return { sourceLang: 'မြန်မာဘာသာ（含部分English）', targetLang: '繁體中文' };
+    if (zh && en && !my) {
+      return { sourceLang: '繁體中文（含部分English）', targetLang: 'မြန်မာဘာသာ' };
+    }
+
+    if (my && en && !zh) {
+      return { sourceLang: 'မြန်မာဘာသာ（含部分English）', targetLang: '繁體中文' };
+    }
 
     return null;
   }
@@ -503,6 +605,7 @@ function isLikelyUntranslated(originalText, translatedText, targetLang) {
   const translated = normalizeText(translatedText);
 
   if (!original || !translated) return false;
+
   if (original === translated && original.length > 8) return true;
 
   if (targetLang === '繁體中文') {
@@ -511,6 +614,10 @@ function isLikelyUntranslated(originalText, translatedText, targetLang) {
 
   if (targetLang === 'ไทย') {
     if (hasChinese(translated) && !hasThai(translated)) return true;
+  }
+
+  if (targetLang === 'English') {
+    if (hasChinese(translated) && !hasEnglish(translated)) return true;
   }
 
   if (targetLang === 'မြန်မာဘာသာ') {
@@ -522,59 +629,83 @@ function isLikelyUntranslated(originalText, translatedText, targetLang) {
 
 function buildTranslationPrompt(sourceLang, targetLang, originalText = '') {
   const isMyanmarRelated = sourceLang.includes('မြန်မာ') || targetLang.includes('မြန်မာ');
-  const chatHints = buildChatPhraseHints(originalText, sourceLang, targetLang);
+  const chatHints = buildChatPhraseHints(originalText, targetLang);
 
   return `
-You are a professional translator for LINE chat messages.
+You are a professional translator for casual LINE chat messages.
 
 Translate from ${sourceLang} into ${targetLang}.
 
-MANDATORY RULES:
+MANDATORY OUTPUT RULES:
 1. Output ONLY the translation.
 2. Do not explain.
 3. Do not add labels.
-4. Translate naturally based on casual chat context.
-5. Preserve meaning, tone, intention, and speaker/listener relationship.
+4. Do not add quotation marks.
+5. Do not add notes.
 6. Preserve placeholders exactly:
    [[[MENTION_*]]], [[[EMOJI_*]]], [[[URL_*]]], [[[KEEP_*]]], [[[CODE_*]]], [[[TOKEN_*]]]
 7. Keep numbers, codes, IDs, URLs, prices, product specs unchanged.
-8. Mixed-language messages must become fluent ${targetLang}.
+8. Translate all natural human-readable words.
 
-Conversation context:
+GENERAL CHAT RULES:
 - Most messages are casual LINE chat.
-- Prefer natural chat meaning over literal dictionary meaning.
+- Prefer natural conversational meaning over literal dictionary meaning.
+- Do not translate word-by-word.
+- Preserve meaning, tone, intention, and social relationship.
 - Short replies should stay short and natural.
-- Avoid stiff, formal, or machine-like wording.
+- Avoid stiff, formal, literary, or machine-like wording.
+- Mixed-language messages must become fluent ${targetLang}.
+- If a sentence is a joke, tease, sarcasm, rhetorical question, or emotional reply, translate the implied meaning naturally.
 
-Thai pronoun consistency rules:
+CRITICAL THAI PRONOUN RULES:
 - คุณ = 你
 - ฉัน = 我
 - ผม = 我
 - เรา = 我 / 我們，依上下文判斷
 - เขา = 他 / 她 / 對方 / 那個人
-- Do NOT translate Thai "เขา" as "你" unless the sentence clearly says the listener is the person.
+- Do NOT translate Thai "เขา" as "你" unless the original clearly means the listener.
 - If context is unclear, translate "เขา" as "他" or "對方", NOT "你".
-- Keep speaker, listener, and third-person references consistent.
+- If a sentence contains both "เขา" and "คุณ", keep them separate:
+  เขา = 他/她/對方
+  คุณ = 你
 - Never randomly change 我、你、他/她.
-- If a sentence contains both "เขา" and "คุณ", keep them separate: เขา = 他/她/對方, คุณ = 你.
+- Keep speaker, listener, and third-person references consistent.
 
-Thai-specific meaning rules:
+THAI CHAT MEANING RULES:
 - Thai "ยุ่ง" in casual chat often means "忙", not "打擾".
 - "ไม่ยุ่งแล้วคะ/ค่ะ" usually means "不忙了 / 現在有空了", not "不再打擾了".
-- "ว่าง" means "有空 / 空閒" in chat context.
+- "ว่าง" usually means "有空 / 空閒" in chat context.
 - Polite particles คะ / ค่ะ / ครับ indicate tone and should not be translated literally.
 
-Myanmar/Burmese rules:
+THAI RHETORICAL / SARCASM RULES:
+- Thai pattern "จะให้...ที่ไหนละ" often means "難道要...嗎？", not a real location question.
+- Do NOT translate "ที่ไหนละ" literally as "去哪裡" when it is used rhetorically.
+- Example:
+  "ไม่ให้ห่วงคุณจะให้ห่วงหมาที่ไหนละ 555"
+  should mean:
+  "不擔心你，難道要去擔心狗嗎？哈哈"
+  or naturally:
+  "不擔心你，不然我要擔心誰？哈哈"
+- "หมา" can literally mean dog, but in rhetorical teasing it may be used humorously.
+- Translate the teasing/rhetorical meaning naturally.
+
+MYANMAR / BURMESE RULES:
 ${isMyanmarRelated ? `
 - For Chinese -> Myanmar, translate meaning naturally, not word-by-word.
 - Use natural Burmese word order.
 - For Myanmar -> Traditional Chinese, use fluent Traditional Chinese.
-- Avoid Chinese-style Burmese and Burmese-style Chinese.
+- Avoid Chinese-style Burmese.
+- Avoid Burmese-style Chinese.
+- Preserve names, numbers, codes, URLs, and placeholders.
 ` : '- No special Burmese handling needed.'}
 
-${chatHints ? `Important phrase hints:\n${chatHints}` : ''}
+${chatHints ? `IMPORTANT PHRASE HINTS:\n${chatHints}` : ''}
 
-Output ONLY the translated result.
+Final check before output:
+- Did you preserve 我 / 你 / 他 correctly?
+- Did you avoid translating Thai rhetorical questions literally?
+- Did you choose casual chat meaning instead of dictionary meaning?
+- Output ONLY the final translation.
 `.trim();
 }
 
@@ -618,6 +749,7 @@ async function callOpenAIChatWithRetry(messages, temperature, label = 'openai') 
       lastErr = err;
 
       const canRetry = shouldRetryOpenAIError(err);
+
       console.error(`${label} attempt ${attempt} failed:`, {
         message: err?.message,
         status: err?.status,
@@ -642,11 +774,14 @@ async function translateWithOpenAI(protectedText, sourceLang, targetLang, strict
   const systemPrompt = strictRetry
     ? `${basePrompt}
 
-Extra retry:
-The previous translation may have used the wrong pronoun or wrong chat meaning.
-Check pronouns carefully:
-เขา = 他/她/對方, not 你.
-คุณ = 你.
+EXTRA STRICT RETRY:
+The previous translation may have:
+- used the wrong pronoun,
+- translated a Thai rhetorical sentence too literally,
+- translated Thai "ที่ไหนละ" as "去哪裡",
+- translated Thai "เขา" as "你",
+- translated Thai "ยุ่ง" as "打擾" when it should be "忙".
+
 Translate again naturally.
 Output only the corrected translation.`
     : basePrompt;
@@ -671,7 +806,7 @@ You are a senior LINE chat translation editor.
 
 Review and improve the translation.
 
-Critical pronoun rules:
+CRITICAL PRONOUN RULES:
 - Thai เขา should usually be 他 / 她 / 對方.
 - Thai เขา must NOT become 你 unless the original clearly means the listener.
 - Thai คุณ = 你.
@@ -679,15 +814,23 @@ Critical pronoun rules:
 - Keep 我、你、他/她 consistent.
 - If uncertain, prefer 他 / 對方 for เขา.
 
-Meaning rules:
+CRITICAL THAI CHAT MEANING RULES:
 - Fix literal dictionary mistakes.
 - Thai ยุ่ง in casual chat usually means 忙.
 - ไม่ยุ่งแล้วคะ/ค่ะ = 不忙了 / 現在有空了.
+- Thai "จะให้...ที่ไหนละ" is often a rhetorical question meaning "難道要...嗎？".
+- Do NOT translate rhetorical "ที่ไหนละ" literally as "去哪裡".
+- "ไม่ให้ห่วงคุณจะให้ห่วงหมาที่ไหนละ" means "不擔心你，難道要去擔心狗嗎？" or naturally "不擔心你，不然我要擔心誰？".
+- Keep jokes and teasing natural.
+
+STYLE:
 - Keep the translation short and natural.
 - Do not add explanation.
-- Preserve placeholders exactly.
+- Preserve placeholders exactly:
+  [[[MENTION_*]]], [[[EMOJI_*]]], [[[URL_*]]], [[[KEEP_*]]], [[[CODE_*]]], [[[TOKEN_*]]]
 
 Output only the improved translation.
+
 Source language: ${sourceLang}
 Target language: ${targetLang}
 `.trim(),
@@ -711,10 +854,15 @@ async function polishMyanmarTranslation(protectedText, translatedText, sourceLan
 You are a senior Chinese-Burmese translation editor.
 
 Improve the translation quality.
-Keep the exact meaning.
-Use natural Burmese or fluent Traditional Chinese.
-Preserve all placeholders exactly.
-Output only the improved translation.
+
+RULES:
+- Keep the exact meaning.
+- Use natural Burmese or fluent Traditional Chinese.
+- Avoid word-by-word translation.
+- Preserve all placeholders exactly:
+  [[[MENTION_*]]], [[[EMOJI_*]]], [[[URL_*]]], [[[KEEP_*]]], [[[CODE_*]]], [[[TOKEN_*]]]
+- Do not add explanation.
+- Output only the improved translation.
 
 Source language: ${sourceLang}
 Target language: ${targetLang}
@@ -763,6 +911,7 @@ async function translateText(text, mention, mode) {
         direction.sourceLang,
         direction.targetLang
       );
+
       if (refined) translatedProtected = refined;
     } catch (err) {
       console.error('refineChatTranslation skipped:', err?.message);
@@ -777,6 +926,7 @@ async function translateText(text, mention, mode) {
         direction.sourceLang,
         direction.targetLang
       );
+
       if (polished) translatedProtected = polished;
     } catch (err) {
       console.error('polishMyanmarTranslation skipped:', err?.message);
@@ -811,7 +961,11 @@ async function translateText(text, mention, mode) {
 
 async function replyText(replyToken, text) {
   if (!replyToken || !text) return null;
-  return client.replyMessage(replyToken, { type: 'text', text });
+
+  return client.replyMessage(replyToken, {
+    type: 'text',
+    text,
+  });
 }
 
 async function handleCommand(event, text) {
@@ -856,6 +1010,8 @@ async function handleCommand(event, text) {
 - 已加強泰文你我他判斷
 - เขา 優先翻成 他/她/對方，不會亂翻成你
 - 已加強 LINE 聊天語境
+- 已加強泰文反問句，例如 จะให้...ที่ไหนละ
+- 已避免「狗去哪裡」這類逐字錯誤
 - 已加強中緬翻譯自然度
 - 已加入 OpenAI 斷線自動重試`
     );
@@ -872,7 +1028,10 @@ async function handleCommand(event, text) {
   }
 
   if (lower === '/auth') {
-    if (!isAdmin(event)) return replyText(event.replyToken, '你沒有授權權限。');
+    if (!isAdmin(event)) {
+      return replyText(event.replyToken, '你沒有授權權限。');
+    }
+
     if (!(sourceType === 'group' || sourceType === 'room')) {
       return replyText(event.replyToken, '只能在群組或多人聊天室內執行 /auth。');
     }
@@ -887,7 +1046,10 @@ async function handleCommand(event, text) {
   }
 
   if (lower === '/unauth') {
-    if (!isAdmin(event)) return replyText(event.replyToken, '你沒有授權權限。');
+    if (!isAdmin(event)) {
+      return replyText(event.replyToken, '你沒有授權權限。');
+    }
+
     if (!(sourceType === 'group' || sourceType === 'room')) {
       return replyText(event.replyToken, '只能在群組或多人聊天室內執行 /unauth。');
     }
@@ -897,7 +1059,10 @@ async function handleCommand(event, text) {
   }
 
   if (lower === '/mode zh-th' || lower === '/mode zh-en' || lower === '/mode zh-my') {
-    if (!isAdmin(event)) return replyText(event.replyToken, '你沒有切換模式的權限。');
+    if (!isAdmin(event)) {
+      return replyText(event.replyToken, '你沒有切換模式的權限。');
+    }
+
     if (!(sourceType === 'group' || sourceType === 'room')) {
       return replyText(event.replyToken, '只能在群組或多人聊天室內切換模式。');
     }
@@ -935,7 +1100,10 @@ async function handleTextMessage(event) {
     const sourceType = getSourceType(event);
 
     if (sourceType === 'group' || sourceType === 'room') {
-      return replyText(event.replyToken, '此群組/聊天室尚未授權使用翻譯功能。請由管理員在本群直接輸入 /auth 進行授權。');
+      return replyText(
+        event.replyToken,
+        '此群組/聊天室尚未授權使用翻譯功能。請由管理員在本群直接輸入 /auth 進行授權。'
+      );
     }
 
     if (sourceType === 'user' && !AUTH_ALLOW_USER_CHAT) {
@@ -949,6 +1117,7 @@ async function handleTextMessage(event) {
   const mode = getSourceMode(sourceId);
 
   const translated = await translateText(originalText, msg.mention, mode);
+
   if (!translated) return null;
 
   return replyText(event.replyToken, translated);
@@ -958,6 +1127,7 @@ async function handleEvent(event) {
   try {
     if (event.type !== 'message') return null;
     if (event.message.type !== 'text') return null;
+
     return await handleTextMessage(event);
   } catch (err) {
     console.error('handleEvent error message:', err?.message);
