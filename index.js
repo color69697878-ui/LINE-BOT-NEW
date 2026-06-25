@@ -57,50 +57,17 @@ const ALWAYS_KEEP_WORDS = new Set([
   'XS', 'S', 'M', 'L', 'XL', 'XXL', '2XL', '3XL',
 ]);
 
-const GLOBAL_DICTIONARY = [
-  // 固定詞可以放這裡
-  // {
-  //   from: '藍白色',
-  //   toZh: '藍白色',
-  //   toTh: 'สีฟ้าขาว',
-  //   toEn: 'blue and white',
-  //   toMy: 'အပြာဖြူ',
-  // },
-];
+const GLOBAL_DICTIONARY = [];
 
 const CHAT_PHRASE_HINTS = [
-  {
-    phrase: 'ไม่ยุ่งแล้วคะ',
-    meaningZh: '不忙了 / 現在有空了',
-  },
-  {
-    phrase: 'ไม่ยุ่งแล้วค่ะ',
-    meaningZh: '不忙了 / 現在有空了',
-  },
-  {
-    phrase: 'ว่างแล้ว',
-    meaningZh: '有空了 / 現在有空',
-  },
-  {
-    phrase: 'ไม่ว่าง',
-    meaningZh: '沒空 / 不方便',
-  },
-  {
-    phrase: 'ได้ค่ะ',
-    meaningZh: '可以 / 好的',
-  },
-  {
-    phrase: 'ไม่ได้มีพิรุธ',
-    meaningZh: '沒有可疑 / 沒什麼怪怪的',
-  },
-  {
-    phrase: 'ไม่ให้ห่วงคุณจะให้ห่วงหมาที่ไหนละ',
-    meaningZh: '不擔心你，難道要去擔心狗嗎？',
-  },
-  {
-    phrase: 'จะให้ห่วงหมาที่ไหนละ',
-    meaningZh: '難道要去擔心狗嗎？',
-  },
+  { phrase: 'ไม่ยุ่งแล้วคะ', meaningZh: '不忙了 / 現在有空了' },
+  { phrase: 'ไม่ยุ่งแล้วค่ะ', meaningZh: '不忙了 / 現在有空了' },
+  { phrase: 'ว่างแล้ว', meaningZh: '有空了 / 現在有空' },
+  { phrase: 'ไม่ว่าง', meaningZh: '沒空 / 不方便' },
+  { phrase: 'ได้ค่ะ', meaningZh: '可以 / 好的' },
+  { phrase: 'ไม่ได้มีพิรุธ', meaningZh: '沒有可疑 / 沒什麼怪怪的' },
+  { phrase: 'ไม่ให้ห่วงคุณจะให้ห่วงหมาที่ไหนละ', meaningZh: '不擔心你，難道要去擔心狗嗎？' },
+  { phrase: 'จะให้ห่วงหมาที่ไหนละ', meaningZh: '難道要去擔心狗嗎？' },
 ];
 
 const DATA_DIR = path.join(__dirname, 'data');
@@ -111,9 +78,7 @@ function sleep(ms) {
 }
 
 function ensureDataDir() {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
 function readJsonSafe(filePath, fallback) {
@@ -140,13 +105,8 @@ function writeJsonSafe(filePath, data) {
 function loadAuthStore() {
   const initial = readJsonSafe(AUTH_FILE, { sources: {} });
 
-  if (!initial || typeof initial !== 'object') {
-    return { sources: {} };
-  }
-
-  if (!initial.sources || typeof initial.sources !== 'object') {
-    initial.sources = {};
-  }
+  if (!initial || typeof initial !== 'object') return { sources: {} };
+  if (!initial.sources || typeof initial.sources !== 'object') initial.sources = {};
 
   for (const sourceId of SEED_ALLOWED_SOURCE_IDS) {
     if (!initial.sources[sourceId]) {
@@ -256,10 +216,7 @@ function isSourceAuthorized(event) {
   const sourceId = getSourceId(event);
 
   if (!sourceId) return false;
-
-  if (sourceType === 'user') {
-    return AUTH_ALLOW_USER_CHAT;
-  }
+  if (sourceType === 'user') return AUTH_ALLOW_USER_CHAT;
 
   const rec = getAuthorizedRecord(sourceId);
   return !!(rec && rec.authorized === true);
@@ -272,7 +229,6 @@ function authorizeSource(sourceId, mode = DEFAULT_TRANSLATION_MODE, note = 'manu
     updatedAt: new Date().toISOString(),
     note,
   };
-
   writeJsonSafe(AUTH_FILE, authStore);
 }
 
@@ -284,7 +240,6 @@ function unauthorizeSource(sourceId) {
     updatedAt: new Date().toISOString(),
     note: 'manual unauth',
   };
-
   writeJsonSafe(AUTH_FILE, authStore);
 }
 
@@ -300,7 +255,6 @@ function setSourceMode(sourceId, mode) {
     updatedAt: new Date().toISOString(),
     note: 'mode updated',
   };
-
   writeJsonSafe(AUTH_FILE, authStore);
 }
 
@@ -365,7 +319,6 @@ function protectMentions(text, mention) {
     if (start < cursor) continue;
 
     result += text.slice(cursor, start);
-
     const original = text.slice(start, end);
     const ph = createPlaceholder('MENTION', idx++);
 
@@ -481,14 +434,12 @@ function applyGlobalDictionaryAfter(text, targetLang) {
     if (!item || !item.from) continue;
 
     let replacement = '';
-
     if (targetLang === '繁體中文') replacement = item.toZh || '';
     if (targetLang === 'ไทย') replacement = item.toTh || '';
     if (targetLang === 'English') replacement = item.toEn || '';
     if (targetLang === 'မြန်မာဘာသာ') replacement = item.toMy || '';
 
     if (!replacement) continue;
-
     out = out.replace(new RegExp(escapeRegExp(item.from), 'g'), replacement);
   }
 
@@ -525,29 +476,15 @@ function detectTranslationDirection(text, mode) {
   if (m === 'zh-th') {
     if (zh && !th) return { sourceLang: '繁體中文', targetLang: 'ไทย' };
     if (th && !zh) return { sourceLang: 'ไทย', targetLang: '繁體中文' };
-
-    if (en && !zh && !th && !my) {
-      return { sourceLang: 'English', targetLang: '繁體中文' };
-    }
+    if (en && !zh && !th && !my) return { sourceLang: 'English', targetLang: '繁體中文' };
 
     if (zh && th) {
-      if (zhCount >= thCount) {
-        return { sourceLang: '繁體中文（含部分ไทย）', targetLang: 'ไทย' };
-      }
-
+      if (zhCount >= thCount) return { sourceLang: '繁體中文（含部分ไทย）', targetLang: 'ไทย' };
       return { sourceLang: 'ไทย（含部分中文）', targetLang: '繁體中文' };
     }
 
     if (zh && en && !th) return { sourceLang: '繁體中文（含部分English）', targetLang: 'ไทย' };
     if (th && en && !zh) return { sourceLang: 'ไทย（含部分English）', targetLang: '繁體中文' };
-
-    if (zh && th && en) {
-      if (zhCount >= thCount) {
-        return { sourceLang: '繁體中文（含部分ไทย/English）', targetLang: 'ไทย' };
-      }
-
-      return { sourceLang: 'ไทย（含部分中文/English）', targetLang: '繁體中文' };
-    }
 
     return null;
   }
@@ -557,10 +494,7 @@ function detectTranslationDirection(text, mode) {
     if (en && !zh && !th && !my) return { sourceLang: 'English', targetLang: '繁體中文' };
 
     if (zh && en && !th && !my) {
-      if (zhCount >= enCount) {
-        return { sourceLang: '繁體中文（含部分English）', targetLang: 'English' };
-      }
-
+      if (zhCount >= enCount) return { sourceLang: '繁體中文（含部分English）', targetLang: 'English' };
       return { sourceLang: 'English（含部分中文）', targetLang: '繁體中文' };
     }
 
@@ -573,26 +507,15 @@ function detectTranslationDirection(text, mode) {
   if (m === 'zh-my') {
     if (zh && !my) return { sourceLang: '繁體中文', targetLang: 'မြန်မာဘာသာ' };
     if (my && !zh) return { sourceLang: 'မြန်မာဘာသာ', targetLang: '繁體中文' };
-
-    if (en && !zh && !my && !th) {
-      return { sourceLang: 'English', targetLang: '繁體中文' };
-    }
+    if (en && !zh && !my && !th) return { sourceLang: 'English', targetLang: '繁體中文' };
 
     if (zh && my) {
-      if (zhCount >= myCount) {
-        return { sourceLang: '繁體中文（含部分မြန်မာဘာသာ）', targetLang: 'မြန်မာဘာသာ' };
-      }
-
+      if (zhCount >= myCount) return { sourceLang: '繁體中文（含部分မြန်မာဘာသာ）', targetLang: 'မြန်မာဘာသာ' };
       return { sourceLang: 'မြန်မာဘာသာ（含部分中文）', targetLang: '繁體中文' };
     }
 
-    if (zh && en && !my) {
-      return { sourceLang: '繁體中文（含部分English）', targetLang: 'မြန်မာဘာသာ' };
-    }
-
-    if (my && en && !zh) {
-      return { sourceLang: 'မြန်မာဘာသာ（含部分English）', targetLang: '繁體中文' };
-    }
+    if (zh && en && !my) return { sourceLang: '繁體中文（含部分English）', targetLang: 'မြန်မာဘာသာ' };
+    if (my && en && !zh) return { sourceLang: 'မြန်မာဘာသာ（含部分English）', targetLang: '繁體中文' };
 
     return null;
   }
@@ -605,7 +528,6 @@ function isLikelyUntranslated(originalText, translatedText, targetLang) {
   const translated = normalizeText(translatedText);
 
   if (!original || !translated) return false;
-
   if (original === translated && original.length > 8) return true;
 
   if (targetLang === '繁體中文') {
@@ -627,6 +549,14 @@ function isLikelyUntranslated(originalText, translatedText, targetLang) {
   return false;
 }
 
+function needsThaiRefine(text) {
+  return /เขา|คุณ|ฉัน|ผม|เรา|ยุ่ง|ว่าง|ที่ไหนละ|ห่วง|หมา|พิรุธ|บอกอะไร|หมายถึง|แจ้ง|ตำรวจ|ลูกค้า|เพื่อน/.test(text);
+}
+
+function needsMyanmarPolish(text) {
+  return normalizeText(text).length >= 30;
+}
+
 function buildTranslationPrompt(sourceLang, targetLang, originalText = '') {
   const isMyanmarRelated = sourceLang.includes('မြန်မာ') || targetLang.includes('မြန်မာ');
   const chatHints = buildChatPhraseHints(originalText, targetLang);
@@ -641,11 +571,10 @@ MANDATORY OUTPUT RULES:
 2. Do not explain.
 3. Do not add labels.
 4. Do not add quotation marks.
-5. Do not add notes.
-6. Preserve placeholders exactly:
+5. Preserve placeholders exactly:
    [[[MENTION_*]]], [[[EMOJI_*]]], [[[URL_*]]], [[[KEEP_*]]], [[[CODE_*]]], [[[TOKEN_*]]]
-7. Keep numbers, codes, IDs, URLs, prices, product specs unchanged.
-8. Translate all natural human-readable words.
+6. Keep numbers, codes, IDs, URLs, prices, product specs unchanged.
+7. Translate all natural human-readable words.
 
 GENERAL CHAT RULES:
 - Most messages are casual LINE chat.
@@ -682,12 +611,10 @@ THAI RHETORICAL / SARCASM RULES:
 - Do NOT translate "ที่ไหนละ" literally as "去哪裡" when it is used rhetorically.
 - Example:
   "ไม่ให้ห่วงคุณจะให้ห่วงหมาที่ไหนละ 555"
-  should mean:
+  means:
   "不擔心你，難道要去擔心狗嗎？哈哈"
   or naturally:
   "不擔心你，不然我要擔心誰？哈哈"
-- "หมา" can literally mean dog, but in rhetorical teasing it may be used humorously.
-- Translate the teasing/rhetorical meaning naturally.
 
 MYANMAR / BURMESE RULES:
 ${isMyanmarRelated ? `
@@ -696,15 +623,14 @@ ${isMyanmarRelated ? `
 - For Myanmar -> Traditional Chinese, use fluent Traditional Chinese.
 - Avoid Chinese-style Burmese.
 - Avoid Burmese-style Chinese.
-- Preserve names, numbers, codes, URLs, and placeholders.
 ` : '- No special Burmese handling needed.'}
 
 ${chatHints ? `IMPORTANT PHRASE HINTS:\n${chatHints}` : ''}
 
-Final check before output:
-- Did you preserve 我 / 你 / 他 correctly?
-- Did you avoid translating Thai rhetorical questions literally?
-- Did you choose casual chat meaning instead of dictionary meaning?
+Final check:
+- Preserve 我 / 你 / 他 correctly.
+- Avoid literal Thai rhetorical translation.
+- Choose casual chat meaning.
 - Output ONLY the final translation.
 `.trim();
 }
@@ -733,7 +659,7 @@ function shouldRetryOpenAIError(err) {
 }
 
 async function callOpenAIChatWithRetry(messages, temperature, label = 'openai') {
-  const maxRetries = 3;
+  const maxRetries = 2;
   let lastErr = null;
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -747,7 +673,6 @@ async function callOpenAIChatWithRetry(messages, temperature, label = 'openai') 
       return response.choices?.[0]?.message?.content?.trim() || '';
     } catch (err) {
       lastErr = err;
-
       const canRetry = shouldRetryOpenAIError(err);
 
       console.error(`${label} attempt ${attempt} failed:`, {
@@ -757,11 +682,8 @@ async function callOpenAIChatWithRetry(messages, temperature, label = 'openai') 
         retry: canRetry,
       });
 
-      if (!canRetry || attempt === maxRetries) {
-        throw err;
-      }
-
-      await sleep(800 * attempt);
+      if (!canRetry || attempt === maxRetries) throw err;
+      await sleep(500 * attempt);
     }
   }
 
@@ -775,14 +697,12 @@ async function translateWithOpenAI(protectedText, sourceLang, targetLang, strict
     ? `${basePrompt}
 
 EXTRA STRICT RETRY:
-The previous translation may have:
-- used the wrong pronoun,
-- translated a Thai rhetorical sentence too literally,
-- translated Thai "ที่ไหนละ" as "去哪裡",
-- translated Thai "เขา" as "你",
-- translated Thai "ยุ่ง" as "打擾" when it should be "忙".
-
-Translate again naturally.
+The previous translation may have used the wrong pronoun or literal chat meaning.
+Check:
+- เขา = 他/她/對方, not 你.
+- คุณ = 你.
+- ยุ่ง often means 忙.
+- ที่ไหนละ in rhetorical sentences is not 去哪裡.
 Output only the corrected translation.`
     : basePrompt;
 
@@ -804,32 +724,18 @@ async function refineChatTranslation(protectedOriginal, translatedText, sourceLa
         content: `
 You are a senior LINE chat translation editor.
 
-Review and improve the translation.
+Fix only if needed.
 
-CRITICAL PRONOUN RULES:
-- Thai เขา should usually be 他 / 她 / 對方.
-- Thai เขา must NOT become 你 unless the original clearly means the listener.
+Important:
+- Thai เขา = 他 / 她 / 對方, not 你.
 - Thai คุณ = 你.
-- Thai ฉัน / ผม = 我.
-- Keep 我、你、他/她 consistent.
-- If uncertain, prefer 他 / 對方 for เขา.
-
-CRITICAL THAI CHAT MEANING RULES:
-- Fix literal dictionary mistakes.
 - Thai ยุ่ง in casual chat usually means 忙.
 - ไม่ยุ่งแล้วคะ/ค่ะ = 不忙了 / 現在有空了.
-- Thai "จะให้...ที่ไหนละ" is often a rhetorical question meaning "難道要...嗎？".
+- Thai "จะให้...ที่ไหนละ" often means "難道要...嗎？".
 - Do NOT translate rhetorical "ที่ไหนละ" literally as "去哪裡".
-- "ไม่ให้ห่วงคุณจะให้ห่วงหมาที่ไหนละ" means "不擔心你，難道要去擔心狗嗎？" or naturally "不擔心你，不然我要擔心誰？".
 - Keep jokes and teasing natural.
-
-STYLE:
-- Keep the translation short and natural.
-- Do not add explanation.
-- Preserve placeholders exactly:
-  [[[MENTION_*]]], [[[EMOJI_*]]], [[[URL_*]]], [[[KEEP_*]]], [[[CODE_*]]], [[[TOKEN_*]]]
-
-Output only the improved translation.
+- Preserve placeholders exactly.
+- Output only the improved translation.
 
 Source language: ${sourceLang}
 Target language: ${targetLang}
@@ -853,16 +759,12 @@ async function polishMyanmarTranslation(protectedText, translatedText, sourceLan
         content: `
 You are a senior Chinese-Burmese translation editor.
 
-Improve the translation quality.
-
-RULES:
-- Keep the exact meaning.
-- Use natural Burmese or fluent Traditional Chinese.
-- Avoid word-by-word translation.
-- Preserve all placeholders exactly:
-  [[[MENTION_*]]], [[[EMOJI_*]]], [[[URL_*]]], [[[KEEP_*]]], [[[CODE_*]]], [[[TOKEN_*]]]
-- Do not add explanation.
-- Output only the improved translation.
+Improve only if needed.
+Keep exact meaning.
+Use natural Burmese or fluent Traditional Chinese.
+Do not explain.
+Preserve placeholders exactly.
+Output only the improved translation.
 
 Source language: ${sourceLang}
 Target language: ${targetLang}
@@ -903,7 +805,7 @@ async function translateText(text, mention, mode) {
 
   const isMyanmarMode = String(mode || '').toLowerCase() === 'zh-my';
 
-  if (isThaiToChinese) {
+  if (isThaiToChinese && needsThaiRefine(normalized)) {
     try {
       const refined = await refineChatTranslation(
         protectedPack.text,
@@ -918,7 +820,7 @@ async function translateText(text, mention, mode) {
     }
   }
 
-  if (isMyanmarMode) {
+  if (isMyanmarMode && needsMyanmarPolish(normalized)) {
     try {
       const polished = await polishMyanmarTranslation(
         protectedPack.text,
@@ -1007,13 +909,12 @@ async function handleCommand(event, text) {
 - zh-my：中文→緬文，緬文→中文，英文→中文
 
 重點：
-- 已加強泰文你我他判斷
-- เขา 優先翻成 他/她/對方，不會亂翻成你
-- 已加強 LINE 聊天語境
-- 已加強泰文反問句，例如 จะให้...ที่ไหนละ
-- 已避免「狗去哪裡」這類逐字錯誤
-- 已加強中緬翻譯自然度
-- 已加入 OpenAI 斷線自動重試`
+- 快速模式：一般句子只翻譯一次
+- 只有容易錯的泰文句型才二次修正
+- เขา 優先翻成 他/她/對方
+- 已優化 ที่ไหนละ 反問句
+- 已優化 ยุ่ง / ว่าง 聊天語境
+- 已加入 OpenAI 斷線重試`
     );
   }
 
@@ -1028,9 +929,7 @@ async function handleCommand(event, text) {
   }
 
   if (lower === '/auth') {
-    if (!isAdmin(event)) {
-      return replyText(event.replyToken, '你沒有授權權限。');
-    }
+    if (!isAdmin(event)) return replyText(event.replyToken, '你沒有授權權限。');
 
     if (!(sourceType === 'group' || sourceType === 'room')) {
       return replyText(event.replyToken, '只能在群組或多人聊天室內執行 /auth。');
@@ -1046,9 +945,7 @@ async function handleCommand(event, text) {
   }
 
   if (lower === '/unauth') {
-    if (!isAdmin(event)) {
-      return replyText(event.replyToken, '你沒有授權權限。');
-    }
+    if (!isAdmin(event)) return replyText(event.replyToken, '你沒有授權權限。');
 
     if (!(sourceType === 'group' || sourceType === 'room')) {
       return replyText(event.replyToken, '只能在群組或多人聊天室內執行 /unauth。');
@@ -1059,9 +956,7 @@ async function handleCommand(event, text) {
   }
 
   if (lower === '/mode zh-th' || lower === '/mode zh-en' || lower === '/mode zh-my') {
-    if (!isAdmin(event)) {
-      return replyText(event.replyToken, '你沒有切換模式的權限。');
-    }
+    if (!isAdmin(event)) return replyText(event.replyToken, '你沒有切換模式的權限。');
 
     if (!(sourceType === 'group' || sourceType === 'room')) {
       return replyText(event.replyToken, '只能在群組或多人聊天室內切換模式。');
