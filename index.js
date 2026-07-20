@@ -653,6 +653,71 @@ function needsMyanmarPolish(text) {
   return normalizeText(text).length >= 30;
 }
 
+
+function detectSentenceType(text, sourceLang = '') {
+  const t = normalizeText(text);
+  if (!t) return 'unknown';
+
+  const hasQuestionMark = /[?？]/u.test(t);
+  const lang = String(sourceLang || '');
+
+  if (hasQuestionMark) return 'question';
+
+  if (lang.includes('繁體中文')) {
+    if (/(嗎|么|呢|吧|是不是|可不可以|有沒有|能不能|要不要|好不好|對不對|對嗎|是嗎|真的嗎|怎麼|為什麼|哪裡|哪個|多少|幾點|誰|什麼|何時|何處)[。！!…]*$/u.test(t)) return 'question';
+  }
+
+  if (lang.includes('ไทย')) {
+    if (/(ไหม|มั้ย|หรือไม่|หรือเปล่า|รึเปล่า|หรือยัง|หรือ|เหรอ|หรอ|ใช่ไหม|ได้ไหม|มั้ยคะ|มั้ยครับ|ไหมคะ|ไหมครับ)[\s.!！。…]*$/u.test(t)) return 'question';
+    if (/^(ใคร|อะไร|ที่ไหน|เมื่อไหร่|ทำไม|อย่างไร|ยังไง|เท่าไหร่|กี่)/u.test(t)) return 'question';
+  }
+
+  if (lang.includes('English')) {
+    if (/^(who|what|when|where|why|how|which|whose|is|are|am|was|were|do|does|did|can|could|will|would|shall|should|have|has|had|may|might)\b/iu.test(t)) return 'question';
+  }
+
+  if (lang.includes('မြန်မာ')) {
+    if (/(လား|လဲ|လေား|မလား|ဘူးလား|သလား|နည်း|ဘာ|ဘယ်|ဘယ်မှာ|ဘယ်သူ|ဘယ်တော့|ဘာကြောင့်)[။!！…]*$/u.test(t)) return 'question';
+  }
+
+  if (/^[\s]*(請|麻煩|幫我|不要|別|記得|快點|ไป|อย่า|ช่วย|กรุณา|please|do not|don't)\b/iu.test(t)) return 'command';
+  if (/[!！]+$/u.test(t)) return 'exclamation';
+  return 'statement';
+}
+
+function outputLooksLikeQuestion(text, targetLang = '') {
+  const t = normalizeText(text);
+  if (!t) return false;
+  if (/[?？]/u.test(t)) return true;
+
+  const lang = String(targetLang || '');
+  if (lang === '繁體中文') {
+    return /(嗎|么|呢|是不是|可以嗎|好嗎|對嗎|是嗎|有嗎|要嗎|行嗎)[。！!…]*$/u.test(t);
+  }
+  if (lang === 'ไทย') {
+    return /(ไหม|มั้ย|หรือไม่|หรือเปล่า|รึเปล่า|หรือยัง|เหรอ|หรอ|ใช่ไหม|ได้ไหม|ไหมคะ|ไหมครับ|มั้ยคะ|มั้ยครับ)[\s.!！。…]*$/u.test(t);
+  }
+  if (lang === 'English') {
+    return /^(who|what|when|where|why|how|which|whose|is|are|am|was|were|do|does|did|can|could|will|would|shall|should|have|has|had|may|might)\b/iu.test(t);
+  }
+  if (lang === 'မြန်မာဘာသာ') {
+    return /(လား|မလား|ဘူးလား|သလား)[။!！…]*$/u.test(t);
+  }
+  return false;
+}
+
+function hasSentenceTypeViolation(originalText, translatedText, sourceLang, targetLang) {
+  const sourceType = detectSentenceType(originalText, sourceLang);
+  if (sourceType === 'statement' && outputLooksLikeQuestion(translatedText, targetLang)) return true;
+  if (sourceType === 'question' && !outputLooksLikeQuestion(translatedText, targetLang)) return true;
+  return false;
+}
+
+function buildSentenceTypeInstruction(originalText, sourceLang, targetLang) {
+  const sourceType = detectSentenceType(originalText, sourceLang);
+  return `SOURCE SENTENCE TYPE: ${sourceType}. The output MUST remain a ${sourceType}. Target language: ${targetLang}.`;
+}
+
 function buildTranslationPrompt(sourceLang, targetLang, originalText = '', conversationContext = '') {
   const isMyanmarRelated = sourceLang.includes('မြန်မာ') || targetLang.includes('မြန်မာ');
   const chatHints = buildChatPhraseHints(originalText, targetLang);
@@ -664,6 +729,22 @@ function buildTranslationPrompt(sourceLang, targetLang, originalText = '', conve
 You are a professional translator for casual LINE chat messages.
 
 Translate from ${sourceLang} into ${targetLang}.
+
+${buildSentenceTypeInstruction(originalText, sourceLang, targetLang)}
+
+SENTENCE-TYPE PRESERVATION — ABSOLUTE RULE:
+- Never change a statement into a question.
+- Never change a question into a statement.
+- Never infer an omitted question merely because the message is casual or lacks punctuation.
+- Do not add question marks or question particles that are absent from the source meaning.
+- For a statement, never add: 嗎 / 呢 / ? / ไหม / มั้ย / หรือเปล่า / เหรอ / လား or an English question structure.
+- Conversation context may clarify pronouns, but it MUST NOT change the sentence type or communicative intent.
+- Translate what is written; do not guess what the sender probably wanted to ask.
+
+Examples:
+- 今天西門町有房間 → วันนี้ซีเหมินติงมีห้องว่าง (NOT: วันนี้ซีเหมินติงมีห้องว่างไหม)
+- 今天下班了 → วันนี้เลิกงานแล้ว (NOT: วันนี้เลิกงานแล้วหรือยัง)
+- 房間很小嗎？ → ห้องเล็กมากไหม? (keep it a question)
 
 MANDATORY OUTPUT RULES:
 1. Output ONLY the translation.
@@ -728,6 +809,7 @@ ${chatHints ? `IMPORTANT PHRASE HINTS:\n${chatHints}` : ''}
 ${contextSection}
 CONTEXT RULES:
 - Use recent context only to resolve omitted subjects, pronouns, relationships, time references, and short replies.
+- Context is evidence, not permission to reinterpret a statement as a question or vice versa.
 - Never merge previous messages into the output.
 - Never answer the conversation; translate only the newest message.
 - Do not invent a subject when the source intentionally omits it.
@@ -803,8 +885,10 @@ async function translateWithOpenAI(protectedText, sourceLang, targetLang, strict
     ? `${basePrompt}
 
 EXTRA STRICT RETRY:
-The previous translation may have used the wrong pronoun or literal chat meaning.
+The previous translation may have used the wrong pronoun, literal chat meaning, or sentence type.
 Check:
+- Preserve the exact sentence type. A statement must stay a statement; a question must stay a question.
+- Never add ไหม / มั้ย / หรือเปล่า / เหรอ / 嗎 / 呢 / လား / ? unless the source is truly a question.
 - เขา = 他/她/對方, not 你.
 - คุณ = 你.
 - ยุ่ง often means 忙.
@@ -831,6 +915,11 @@ async function refineChatTranslation(protectedOriginal, translatedText, sourceLa
 You are a senior LINE chat translation editor.
 
 Fix only if needed.
+
+ABSOLUTE SENTENCE-TYPE RULE:
+- Preserve whether the original is a statement, question, command, or exclamation.
+- Never turn a statement into a question.
+- Never add question particles or question marks not supported by the original.
 
 Important:
 - Thai เขา = 他 / 她 / 對方, not 你.
@@ -866,7 +955,8 @@ async function polishMyanmarTranslation(protectedText, translatedText, sourceLan
 You are a senior Chinese-Burmese translation editor.
 
 Improve only if needed.
-Keep exact meaning.
+Keep exact meaning and exact sentence type.
+Never turn a statement into a question or add Burmese question particles not present in meaning.
 Use natural Burmese or fluent Traditional Chinese.
 Do not explain.
 Preserve placeholders exactly.
@@ -948,6 +1038,33 @@ async function translateText(text, mention, mode, conversationEntries = []) {
 
   if (!restored) return null;
 
+  if (hasSentenceTypeViolation(normalized, restored, direction.sourceLang, direction.targetLang)) {
+    try {
+      const sentenceTypeRetry = await translateWithOpenAI(
+        protectedPack.text,
+        direction.sourceLang,
+        direction.targetLang,
+        true,
+        ''
+      );
+
+      if (sentenceTypeRetry) {
+        const checkedRetry = applyGlobalDictionaryAfter(
+          restorePlaceholders(sentenceTypeRetry, protectedPack.map),
+          direction.targetLang
+        ).trim();
+
+        if (checkedRetry && !hasSentenceTypeViolation(normalized, checkedRetry, direction.sourceLang, direction.targetLang)) {
+          restored = checkedRetry;
+        } else {
+          console.warn('Sentence-type retry still violated the source sentence type; keeping the safer candidate.');
+        }
+      }
+    } catch (err) {
+      console.error('sentence-type retry skipped:', err?.message);
+    }
+  }
+
   if (isLikelyUntranslated(normalized, restored, direction.targetLang)) {
     translatedProtected = await translateWithOpenAI(
       protectedPack.text,
@@ -963,8 +1080,18 @@ async function translateText(text, mention, mode, conversationEntries = []) {
         direction.targetLang
       ).trim();
 
-      if (retryRestored) restored = retryRestored;
+      if (retryRestored && !hasSentenceTypeViolation(normalized, retryRestored, direction.sourceLang, direction.targetLang)) restored = retryRestored;
     }
+  }
+
+  if (hasSentenceTypeViolation(normalized, restored, direction.sourceLang, direction.targetLang)) {
+    console.error('Blocked translation because sentence type still changed after retry:', {
+      original: normalized,
+      translation: restored,
+      sourceLang: direction.sourceLang,
+      targetLang: direction.targetLang,
+    });
+    return null;
   }
 
   return restored
