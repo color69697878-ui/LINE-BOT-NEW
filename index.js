@@ -35,6 +35,11 @@ const REQUIRE_AUTHORIZATION = true;
 const AUTH_ALLOW_USER_CHAT = String(process.env.AUTH_ALLOW_USER_CHAT || 'false').toLowerCase() === 'true';
 const DEFAULT_TRANSLATION_MODE = String(process.env.TRANSLATION_MODE || 'zh-th').toLowerCase();
 
+const CONTEXT_ENABLED = String(process.env.CONTEXT_ENABLED || 'true').toLowerCase() !== 'false';
+const CONTEXT_MAX_MESSAGES = Math.max(2, Math.min(30, Number(process.env.CONTEXT_MAX_MESSAGES || 12)));
+const CONTEXT_MAX_CHARS = Math.max(500, Math.min(12000, Number(process.env.CONTEXT_MAX_CHARS || 4000)));
+const CONTEXT_TTL_HOURS = Math.max(1, Number(process.env.CONTEXT_TTL_HOURS || 72));
+
 const ADMIN_USER_IDS = new Set(
   String(process.env.ADMIN_USER_IDS || '')
     .split(',')
@@ -72,6 +77,7 @@ const CHAT_PHRASE_HINTS = [
 
 const DATA_DIR = path.join(__dirname, 'data');
 const AUTH_FILE = path.join(DATA_DIR, 'authorized-sources.json');
+const CONTEXT_FILE = path.join(DATA_DIR, 'conversation-context.json');
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -124,6 +130,96 @@ function loadAuthStore() {
 }
 
 let authStore = loadAuthStore();
+
+
+function loadContextStore() {
+  const initial = readJsonSafe(CONTEXT_FILE, { conversations: {} });
+  if (!initial || typeof initial !== 'object') return { conversations: {} };
+  if (!initial.conversations || typeof initial.conversations !== 'object') {
+    initial.conversations = {};
+  }
+  return initial;
+}
+
+let contextStore = loadContextStore();
+let contextWriteTimer = null;
+
+function scheduleContextWrite() {
+  if (contextWriteTimer) clearTimeout(contextWriteTimer);
+  contextWriteTimer = setTimeout(() => {
+    contextWriteTimer = null;
+    writeJsonSafe(CONTEXT_FILE, contextStore);
+  }, 300);
+  if (typeof contextWriteTimer.unref === 'function') contextWriteTimer.unref();
+}
+
+function getConversationKey(event) {
+  const sourceId = getSourceId(event);
+  return sourceId ? `${getSourceType(event)}:${sourceId}` : '';
+}
+
+function pruneConversationEntries(entries) {
+  const cutoff = Date.now() - CONTEXT_TTL_HOURS * 60 * 60 * 1000;
+  const cleaned = (Array.isArray(entries) ? entries : []).filter(item => {
+    const ts = Date.parse(item?.createdAt || '');
+    return item && typeof item.original === 'string' && typeof item.translation === 'string' && (!Number.isFinite(ts) || ts >= cutoff);
+  });
+  return cleaned.slice(-CONTEXT_MAX_MESSAGES);
+}
+
+function getConversationEntries(event) {
+  if (!CONTEXT_ENABLED) return [];
+  const key = getConversationKey(event);
+  if (!key) return [];
+  const cleaned = pruneConversationEntries(contextStore.conversations[key]);
+  contextStore.conversations[key] = cleaned;
+  return cleaned;
+}
+
+function addConversationEntry(event, entry) {
+  if (!CONTEXT_ENABLED) return;
+  const key = getConversationKey(event);
+  if (!key) return;
+
+  const current = getConversationEntries(event);
+  current.push({
+    userId: getUserIdFromEvent(event) || '',
+    sourceLang: entry.sourceLang,
+    targetLang: entry.targetLang,
+    original: normalizeText(entry.original),
+    translation: normalizeText(entry.translation),
+    createdAt: new Date().toISOString(),
+  });
+  contextStore.conversations[key] = pruneConversationEntries(current);
+  scheduleContextWrite();
+}
+
+function clearConversationEntries(event) {
+  const key = getConversationKey(event);
+  if (!key) return false;
+  delete contextStore.conversations[key];
+  scheduleContextWrite();
+  return true;
+}
+
+function buildConversationContext(entries) {
+  if (!CONTEXT_ENABLED || !Array.isArray(entries) || entries.length === 0) return '';
+
+  const lines = [];
+  let totalChars = 0;
+  for (const item of entries.slice().reverse()) {
+    const block = [
+      `Previous original (${item.sourceLang || 'unknown'}): ${item.original}`,
+      `Previous translation (${item.targetLang || 'unknown'}): ${item.translation}`,
+    ].join('\n');
+
+    if (totalChars + block.length > CONTEXT_MAX_CHARS) break;
+    lines.unshift(block);
+    totalChars += block.length;
+  }
+
+  return lines.join('\n\n');
+}
 
 function escapeRegExp(str) {
   return String(str).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -557,9 +653,12 @@ function needsMyanmarPolish(text) {
   return normalizeText(text).length >= 30;
 }
 
-function buildTranslationPrompt(sourceLang, targetLang, originalText = '') {
+function buildTranslationPrompt(sourceLang, targetLang, originalText = '', conversationContext = '') {
   const isMyanmarRelated = sourceLang.includes('မြန်မာ') || targetLang.includes('မြန်မာ');
   const chatHints = buildChatPhraseHints(originalText, targetLang);
+  const contextSection = conversationContext
+    ? `\nRECENT CONVERSATION CONTEXT (reference only; translate only the newest user message):\n${conversationContext}\n`
+    : '';
 
   return `
 You are a professional translator for casual LINE chat messages.
@@ -626,6 +725,13 @@ ${isMyanmarRelated ? `
 ` : '- No special Burmese handling needed.'}
 
 ${chatHints ? `IMPORTANT PHRASE HINTS:\n${chatHints}` : ''}
+${contextSection}
+CONTEXT RULES:
+- Use recent context only to resolve omitted subjects, pronouns, relationships, time references, and short replies.
+- Never merge previous messages into the output.
+- Never answer the conversation; translate only the newest message.
+- Do not invent a subject when the source intentionally omits it.
+- Preserve speaker/listener/third-person roles consistently across turns.
 
 Final check:
 - Preserve 我 / 你 / 他 correctly.
@@ -690,8 +796,8 @@ async function callOpenAIChatWithRetry(messages, temperature, label = 'openai') 
   throw lastErr;
 }
 
-async function translateWithOpenAI(protectedText, sourceLang, targetLang, strictRetry = false) {
-  const basePrompt = buildTranslationPrompt(sourceLang, targetLang, protectedText);
+async function translateWithOpenAI(protectedText, sourceLang, targetLang, strictRetry = false, conversationContext = '') {
+  const basePrompt = buildTranslationPrompt(sourceLang, targetLang, protectedText, conversationContext);
 
   const systemPrompt = strictRetry
     ? `${basePrompt}
@@ -780,7 +886,7 @@ Target language: ${targetLang}
   );
 }
 
-async function translateText(text, mention, mode) {
+async function translateText(text, mention, mode, conversationEntries = []) {
   const normalized = normalizeText(text);
   if (!shouldTranslateText(normalized)) return null;
 
@@ -789,12 +895,14 @@ async function translateText(text, mention, mode) {
 
   const beforeDict = applyGlobalDictionaryBefore(normalized);
   const protectedPack = protectText(beforeDict, mention);
+  const conversationContext = buildConversationContext(conversationEntries);
 
   let translatedProtected = await translateWithOpenAI(
     protectedPack.text,
     direction.sourceLang,
     direction.targetLang,
-    false
+    false,
+    conversationContext
   );
 
   if (!translatedProtected) return null;
@@ -845,7 +953,8 @@ async function translateText(text, mention, mode) {
       protectedPack.text,
       direction.sourceLang,
       direction.targetLang,
-      true
+      true,
+      conversationContext
     );
 
     if (translatedProtected) {
@@ -858,7 +967,9 @@ async function translateText(text, mention, mode) {
     }
   }
 
-  return restored || null;
+  return restored
+    ? { text: restored, sourceLang: direction.sourceLang, targetLang: direction.targetLang }
+    : null;
 }
 
 async function replyText(replyToken, text) {
@@ -897,6 +1008,8 @@ async function handleCommand(event, text) {
 /ping
 /id
 /status
+/memory
+/clearcontext
 /auth
 /unauth
 /mode zh-th
@@ -914,7 +1027,8 @@ async function handleCommand(event, text) {
 - เขา 優先翻成 他/她/對方
 - 已優化 ที่ไหนละ 反問句
 - 已優化 ยุ่ง / ว่าง 聊天語境
-- 已加入 OpenAI 斷線重試`
+- 已加入 OpenAI 斷線重試
+- 已加入聊天室獨立對話記憶`
     );
   }
 
@@ -926,6 +1040,20 @@ async function handleCommand(event, text) {
       event.replyToken,
       `授權狀態：${authorized ? '已授權' : '未授權'}\n模式：${mode}（${modeDisplayName(mode)}）\n管理員：${isAdmin(event) ? '是' : '否'}\n你的 userId：${userId}`
     );
+  }
+
+  if (lower === '/memory' || lower === '!memory') {
+    const count = getConversationEntries(event).length;
+    return replyText(
+      event.replyToken,
+      `對話記憶：${CONTEXT_ENABLED ? '已啟用' : '已停用'}\n目前保留：${count} 則\n上限：${CONTEXT_MAX_MESSAGES} 則\n保存期限：${CONTEXT_TTL_HOURS} 小時`
+    );
+  }
+
+  if (lower === '/clearcontext' || lower === '!clearcontext') {
+    if (!isAdmin(event)) return replyText(event.replyToken, '你沒有清除對話記憶的權限。');
+    clearConversationEntries(event);
+    return replyText(event.replyToken, '已清除此聊天室的翻譯對話記憶。');
   }
 
   if (lower === '/auth') {
@@ -1011,11 +1139,19 @@ async function handleTextMessage(event) {
   const sourceId = getSourceId(event);
   const mode = getSourceMode(sourceId);
 
-  const translated = await translateText(originalText, msg.mention, mode);
+  const conversationEntries = getConversationEntries(event);
+  const result = await translateText(originalText, msg.mention, mode, conversationEntries);
 
-  if (!translated) return null;
+  if (!result?.text) return null;
 
-  return replyText(event.replyToken, translated);
+  addConversationEntry(event, {
+    original: originalText,
+    translation: result.text,
+    sourceLang: result.sourceLang,
+    targetLang: result.targetLang,
+  });
+
+  return replyText(event.replyToken, result.text);
 }
 
 async function handleEvent(event) {
@@ -1051,6 +1187,10 @@ app.get('/health', (req, res) => {
     defaultMode: DEFAULT_TRANSLATION_MODE,
     model: OPENAI_MODEL,
     authorizedCount: Object.values(authStore.sources).filter(v => v && v.authorized).length,
+    contextEnabled: CONTEXT_ENABLED,
+    contextMaxMessages: CONTEXT_MAX_MESSAGES,
+    contextTtlHours: CONTEXT_TTL_HOURS,
+    conversationCount: Object.keys(contextStore.conversations).length,
   });
 });
 
@@ -1072,4 +1212,7 @@ app.listen(PORT, () => {
   console.log(`✅ DEFAULT_TRANSLATION_MODE = ${DEFAULT_TRANSLATION_MODE}`);
   console.log(`✅ OPENAI_MODEL = ${OPENAI_MODEL}`);
   console.log(`✅ ADMIN_USER_IDS count = ${ADMIN_USER_IDS.size}`);
+  console.log(`✅ CONTEXT_ENABLED = ${CONTEXT_ENABLED}`);
+  console.log(`✅ CONTEXT_MAX_MESSAGES = ${CONTEXT_MAX_MESSAGES}`);
+  console.log(`✅ CONTEXT_TTL_HOURS = ${CONTEXT_TTL_HOURS}`);
 });
