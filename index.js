@@ -664,11 +664,13 @@ function detectSentenceType(text, sourceLang = '') {
   if (hasQuestionMark) return 'question';
 
   if (lang.includes('繁體中文')) {
-    if (/(嗎|么|呢|吧|是不是|可不可以|有沒有|能不能|要不要|好不好|對不對|對嗎|是嗎|真的嗎|怎麼|為什麼|哪裡|哪個|多少|幾點|誰|什麼|何時|何處)[。！!…]*$/u.test(t)) return 'question';
+    if (/(嗎|么|呢|是不是|可不可以|有沒有|能不能|要不要|好不好|對不對|對嗎|是嗎|真的嗎|怎麼|為什麼|哪裡|哪個|多少|幾點|誰|什麼|何時|何處)[。！!…]*$/u.test(t)) return 'question';
   }
 
   if (lang.includes('ไทย')) {
-    if (/(ไหม|มั้ย|หรือไม่|หรือเปล่า|รึเปล่า|หรือยัง|หรือ|เหรอ|หรอ|ใช่ไหม|ได้ไหม|มั้ยคะ|มั้ยครับ|ไหมคะ|ไหมครับ)[\s.!！。…]*$/u.test(t)) return 'question';
+    // 泰文口語疑問詞後面常接禮貌語氣詞：คะ / ค่ะ / ครับ / จ๊ะ / จ้ะ
+    // 例如：หรอคะ、เหรอค่ะ、ไหมครับ、หรือคะ，都必須判定為疑問句。
+    if (/(?:ไหม|มั้ย|หรือไม่|หรือเปล่า|รึเปล่า|หรือยัง|หรือ|เหรอ|หรอ|ใช่ไหม|ได้ไหม)(?:คะ|ค่ะ|ครับ|จ๊ะ|จ้ะ)?[\s.!！。…]*$/u.test(t)) return 'question';
     if (/^(ใคร|อะไร|ที่ไหน|เมื่อไหร่|ทำไม|อย่างไร|ยังไง|เท่าไหร่|กี่)/u.test(t)) return 'question';
   }
 
@@ -680,7 +682,9 @@ function detectSentenceType(text, sourceLang = '') {
     if (/(လား|လဲ|လေား|မလား|ဘူးလား|သလား|နည်း|ဘာ|ဘယ်|ဘယ်မှာ|ဘယ်သူ|ဘယ်တော့|ဘာကြောင့်)[။!！…]*$/u.test(t)) return 'question';
   }
 
-  if (/^[\s]*(請|麻煩|幫我|不要|別|記得|快點|ไป|อย่า|ช่วย|กรุณา|please|do not|don't)\b/iu.test(t)) return 'command';
+  if (/^[\s]*(請|麻煩|幫我|不要|別|記得|快點|過來|下來|上來|回來|出去|進來|ไป|อย่า|ช่วย|กรุณา|please|do not|don't)\b/iu.test(t)) return 'command';
+  // 中文句尾「吧」通常表示建議、邀請或較柔和的祈使，不是疑問句。
+  if (lang.includes('繁體中文') && /吧[。！!…]*$/u.test(t)) return 'command';
   if (/[!！]+$/u.test(t)) return 'exclamation';
   return 'statement';
 }
@@ -695,7 +699,7 @@ function outputLooksLikeQuestion(text, targetLang = '') {
     return /(嗎|么|呢|是不是|可以嗎|好嗎|對嗎|是嗎|有嗎|要嗎|行嗎)[。！!…]*$/u.test(t);
   }
   if (lang === 'ไทย') {
-    return /(ไหม|มั้ย|หรือไม่|หรือเปล่า|รึเปล่า|หรือยัง|เหรอ|หรอ|ใช่ไหม|ได้ไหม|ไหมคะ|ไหมครับ|มั้ยคะ|มั้ยครับ)[\s.!！。…]*$/u.test(t);
+    return /(?:ไหม|มั้ย|หรือไม่|หรือเปล่า|รึเปล่า|หรือยัง|หรือ|เหรอ|หรอ|ใช่ไหม|ได้ไหม)(?:คะ|ค่ะ|ครับ|จ๊ะ|จ้ะ)?[\s.!！。…]*$/u.test(t);
   }
   if (lang === 'English') {
     return /^(who|what|when|where|why|how|which|whose|is|are|am|was|were|do|does|did|can|could|will|would|shall|should|have|has|had|may|might)\b/iu.test(t);
@@ -736,6 +740,7 @@ SENTENCE-TYPE PRESERVATION — ABSOLUTE RULE:
 - Never change a statement into a question.
 - Never change a question into a statement.
 - Never infer an omitted question merely because the message is casual or lacks punctuation.
+- Chinese sentence-final 吧 usually marks a suggestion, invitation, or softened command; it is NOT automatically a question.
 - Do not add question marks or question particles that are absent from the source meaning.
 - For a statement, never add: 嗎 / 呢 / ? / ไหม / มั้ย / หรือเปล่า / เหรอ / လား or an English question structure.
 - Conversation context may clarify pronouns, but it MUST NOT change the sentence type or communicative intent.
@@ -1085,13 +1090,14 @@ async function translateText(text, mention, mode, conversationEntries = []) {
   }
 
   if (hasSentenceTypeViolation(normalized, restored, direction.sourceLang, direction.targetLang)) {
-    console.error('Blocked translation because sentence type still changed after retry:', {
+    // 不再因句型檢查器無法辨識罕見口語而讓機器人完全不回覆。
+    // 前面已經執行嚴格重翻；若仍有差異，記錄警告並回傳最佳候選翻譯。
+    console.warn('Sentence-type check still differs after retry; returning best candidate instead of silently dropping:', {
       original: normalized,
       translation: restored,
       sourceLang: direction.sourceLang,
       targetLang: direction.targetLang,
     });
-    return null;
   }
 
   return restored
@@ -1333,7 +1339,7 @@ app.post('/webhook', line.middleware(config), async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`✅ LINE bot server running on port ${PORT}`);
+  console.log(`✅ LINE bot server running on port ${PORT} (v3.2)`);
   console.log(`✅ REQUIRE_AUTHORIZATION = ${REQUIRE_AUTHORIZATION}`);
   console.log(`✅ AUTH_ALLOW_USER_CHAT = ${AUTH_ALLOW_USER_CHAT}`);
   console.log(`✅ DEFAULT_TRANSLATION_MODE = ${DEFAULT_TRANSLATION_MODE}`);
