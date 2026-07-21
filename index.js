@@ -646,11 +646,71 @@ function isLikelyUntranslated(originalText, translatedText, targetLang) {
 }
 
 function needsThaiRefine(text) {
-  return /เขา|คุณ|ฉัน|ผม|เรา|ยุ่ง|ว่าง|ที่ไหนละ|ห่วง|หมา|พิรุธ|บอกอะไร|หมายถึง|แจ้ง|ตำรวจ|ลูกค้า|เพื่อน/.test(text);
+  return /เขา|คุณ|ฉัน|ผม|เรา|ยุ่ง|ว่าง|ที่ไหนละ|ห่วง|หมา|พิรุธ|บอกอะไร|หมายถึง|แจ้ง|ตำรวจ|ลูกค้า|เพื่อน|ก่อน|หลัง|ไม่ได้|ไม่ใช่|ไม่มี|ยัง|แล้ว|กำลัง|จะ|เคย|เพิ่ง|หรอ|เหรอ|ไหม|มั้ย/.test(text);
 }
 
 function needsMyanmarPolish(text) {
   return normalizeText(text).length >= 30;
+}
+
+
+function buildThaiSemanticHints(text, sourceLang, targetLang) {
+  if (!String(sourceLang || '').includes('ไทย')) return '';
+
+  const t = normalizeText(text);
+  const hints = [];
+
+  // 時間方向：這兩個詞翻反會造成實質意思相反。
+  if (/ก่อน\s*\d{1,2}(?::\d{2})?/u.test(t) || /ก่อนเวลา/u.test(t)) {
+    hints.push('- ก่อน + time = before that time / 在該時間之前；絕對不能翻成之後。');
+  }
+  if (/หลัง\s*\d{1,2}(?::\d{2})?/u.test(t) || /หลังเวลา/u.test(t)) {
+    hints.push('- หลัง + time = after that time / 在該時間之後；絕對不能翻成之前。');
+  }
+
+  // 否定、時態、體貌。
+  if (/ไม่ได้/u.test(t)) hints.push('- ไม่ได้ = cannot / not possible / did not（依句意）；必須保留否定。');
+  if (/ไม่ใช่/u.test(t)) hints.push('- ไม่ใช่ = is not / 不是；必須保留否定。');
+  if (/ไม่มี/u.test(t)) hints.push('- ไม่มี = do not have / there is no / 沒有；必須保留否定。');
+  if (/(^|\s)ไม่/u.test(t)) hints.push('- ไม่ is a negator；不可漏譯或翻成肯定。');
+  if (/ยัง/u.test(t)) hints.push('- ยัง may mean still / yet；依句型保留「還／尚未」的時間關係。');
+  if (/แล้ว/u.test(t)) hints.push('- แล้ว often marks already / completion；不可無故翻成「還沒」。');
+  if (/กำลัง/u.test(t)) hints.push('- กำลัง marks an action in progress（正在）。');
+  if (/เพิ่ง/u.test(t)) hints.push('- เพิ่ง = just recently / 剛剛。');
+  if (/เคย/u.test(t)) hints.push('- เคย = ever / 曾經。');
+  if (/จะ/u.test(t)) hints.push('- จะ usually marks intention or future（要／將會），依上下文翻譯。');
+
+  // 常見疑問與語氣。
+  if (/(?:หรอ|เหรอ|ไหม|มั้ย|หรือเปล่า)(?:คะ|ค่ะ|ครับ|จ๊ะ|จ้ะ)?[\s.!！。…]*$/u.test(t)) {
+    hints.push('- 句尾疑問詞加禮貌詞仍是疑問句；中文通常保留「嗎／呢／是不是」。');
+  }
+  if (/ก่อน\s*02:00\s*ไม่ได้\s*(?:หรอ|เหรอ)/u.test(t.replace(/\s+/g, ''))) {
+    hints.push('- 本句結構是「02:00 之前不行嗎？」／「不能在 02:00 前嗎？」。');
+  }
+
+  if (!hints.length) return '';
+  return `THAI SEMANTIC ANCHORS (must preserve):\n${hints.join('\n')}`;
+}
+
+function hasThaiSemanticViolation(originalText, translatedText, sourceLang, targetLang) {
+  if (!String(sourceLang || '').includes('ไทย') || targetLang !== '繁體中文') return false;
+
+  const src = normalizeText(originalText).replace(/\s+/g, '');
+  const out = normalizeText(translatedText);
+
+  const srcBeforeTime = /ก่อน\d{1,2}(?::\d{2})?/u.test(src);
+  const srcAfterTime = /หลัง\d{1,2}(?::\d{2})?/u.test(src);
+  const outBefore = /(之前|以前|前\b|前面)/u.test(out);
+  const outAfter = /(之後|以後|後\b|後面)/u.test(out);
+
+  if (srcBeforeTime && outAfter && !outBefore) return true;
+  if (srcAfterTime && outBefore && !outAfter) return true;
+
+  const srcNegative = /ไม่ได้|ไม่ใช่|ไม่มี|(^|[^ก-๙])ไม่/u.test(src);
+  const outNegative = /(不|沒|無|未|不能|不行|不可以|不是|沒有|尚未)/u.test(out);
+  if (srcNegative && !outNegative) return true;
+
+  return false;
 }
 
 
@@ -682,7 +742,9 @@ function detectSentenceType(text, sourceLang = '') {
     if (/(လား|လဲ|လေား|မလား|ဘူးလား|သလား|နည်း|ဘာ|ဘယ်|ဘယ်မှာ|ဘယ်သူ|ဘယ်တော့|ဘာကြောင့်)[။!！…]*$/u.test(t)) return 'question';
   }
 
-  if (/^[\s]*(請|麻煩|幫我|不要|別|記得|快點|過來|下來|上來|回來|出去|進來|ไป|อย่า|ช่วย|กรุณา|please|do not|don't)\b/iu.test(t)) return 'command';
+  if (/^[\s]*(?:請|麻煩|幫我|不要|別|記得|快點|過來|下來|上來|回來|出去|進來)/u.test(t)) return 'command';
+  if (/^[\s]*(?:ไป|อย่า|ช่วย|กรุณา)(?:\s|$)/u.test(t)) return 'command';
+  if (/^[\s]*(?:please|do not|don't)\b/iu.test(t)) return 'command';
   // 中文句尾「吧」通常表示建議、邀請或較柔和的祈使，不是疑問句。
   if (lang.includes('繁體中文') && /吧[。！!…]*$/u.test(t)) return 'command';
   if (/[!！]+$/u.test(t)) return 'exclamation';
@@ -725,6 +787,7 @@ function buildSentenceTypeInstruction(originalText, sourceLang, targetLang) {
 function buildTranslationPrompt(sourceLang, targetLang, originalText = '', conversationContext = '') {
   const isMyanmarRelated = sourceLang.includes('မြန်မာ') || targetLang.includes('မြန်မာ');
   const chatHints = buildChatPhraseHints(originalText, targetLang);
+  const thaiSemanticHints = buildThaiSemanticHints(originalText, sourceLang, targetLang);
   const contextSection = conversationContext
     ? `\nRECENT CONVERSATION CONTEXT (reference only; translate only the newest user message):\n${conversationContext}\n`
     : '';
@@ -811,6 +874,7 @@ ${isMyanmarRelated ? `
 ` : '- No special Burmese handling needed.'}
 
 ${chatHints ? `IMPORTANT PHRASE HINTS:\n${chatHints}` : ''}
+${thaiSemanticHints ? `${thaiSemanticHints}\n` : ''}
 ${contextSection}
 CONTEXT RULES:
 - Use recent context only to resolve omitted subjects, pronouns, relationships, time references, and short replies.
@@ -898,6 +962,9 @@ Check:
 - คุณ = 你.
 - ยุ่ง often means 忙.
 - ที่ไหนละ in rhetorical sentences is not 去哪裡.
+- ก่อน + time = before / 之前; หลัง + time = after / 之後. Never reverse them.
+- Preserve every negation: ไม่ / ไม่ได้ / ไม่ใช่ / ไม่มี.
+- For ก่อน02:00ไม่ได้หรอ, the meaning is 02:00 之前不行嗎？
 Output only the corrected translation.`
     : basePrompt;
 
@@ -1067,6 +1134,33 @@ async function translateText(text, mention, mode, conversationEntries = []) {
       }
     } catch (err) {
       console.error('sentence-type retry skipped:', err?.message);
+    }
+  }
+
+  if (hasThaiSemanticViolation(normalized, restored, direction.sourceLang, direction.targetLang)) {
+    try {
+      const semanticRetry = await translateWithOpenAI(
+        protectedPack.text,
+        direction.sourceLang,
+        direction.targetLang,
+        true,
+        ''
+      );
+
+      if (semanticRetry) {
+        const checkedSemanticRetry = applyGlobalDictionaryAfter(
+          restorePlaceholders(semanticRetry, protectedPack.map),
+          direction.targetLang
+        ).trim();
+
+        if (checkedSemanticRetry && !hasThaiSemanticViolation(normalized, checkedSemanticRetry, direction.sourceLang, direction.targetLang)) {
+          restored = checkedSemanticRetry;
+        } else {
+          console.warn('Thai semantic retry still has a possible direction/negation mismatch; returning best candidate.');
+        }
+      }
+    } catch (err) {
+      console.error('Thai semantic retry skipped:', err?.message);
     }
   }
 
